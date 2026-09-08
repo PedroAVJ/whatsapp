@@ -1,0 +1,29 @@
+{
+  "name": "@pedroavj/whatsapp",
+  "version": "0.11.10",
+  "private": true,
+  "description": "Use the installed whatsapp CLI with Apple Contacts identity verification for WhatsApp chats, media, guarded drafts, and approval-gated disclosed messages.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PedroAVJ/whatsapp.git"
+  },
+  "homepage": "https://github.com/PedroAVJ/whatsapp#readme",
+  "bugs": {
+    "url": "https://github.com/PedroAVJ/whatsapp/issues"
+  },
+  "bin": {
+    "whatsapp": "./bin/whatsapp"
+  },
+  "scripts": {
+    "start": "/bin/zsh ./scripts/start_bridge.sh",
+    "stop": "/bin/zsh ./scripts/stop_bridge.sh",
+    "status": "/bin/zsh ./scripts/status_bridge.sh",
+    "reset-sync": "/bin/zsh ./scripts/reset_sync.sh",
+    "cli": "python3 ./cli/whatsapp_cli.py",
+    "backend": "/bin/zsh ./scripts/run_cli.sh",
+    "mcp": "/bin/zsh ./scripts/run_mcp.sh",
+    "setup": "/bin/zsh ./scripts/setup.sh",
+    "test": "node --test tests/*.test.mjs && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'"
+  }
+}

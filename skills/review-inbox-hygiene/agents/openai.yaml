@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Inbox Hygiene"
+  short_description: "Recommend inbox cleanup without changing sources"
+  default_prompt: "Use $review-inbox-hygiene to review recent inbound WhatsApp messages without changing chats."

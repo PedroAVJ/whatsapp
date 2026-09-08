@@ -1,0 +1,6 @@
+interface:
+  display_name: "Draft WhatsApp Message"
+  short_description: "Gather WhatsApp context for a user-voice draft"
+  default_prompt: "Use $draft-message with $draft-user-voice to draft a WhatsApp reply without sending it."
+policy:
+  allow_implicit_invocation: true

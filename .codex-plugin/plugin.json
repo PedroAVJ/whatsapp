@@ -1,0 +1,44 @@
+{
+  "name": "whatsapp",
+  "version": "0.11.10",
+  "description": "Use the installed whatsapp CLI with Apple Contacts identity verification for WhatsApp chats, media, guarded drafts, and approval-gated disclosed messages.",
+  "author": {
+    "name": "PedroAVJ",
+    "url": "https://github.com/PedroAVJ"
+  },
+  "homepage": "https://github.com/PedroAVJ/whatsapp",
+  "repository": "https://github.com/PedroAVJ/whatsapp",
+  "license": "MIT",
+  "keywords": [
+    "whatsapp",
+    "messages",
+    "chat",
+    "media",
+    "drafts"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "WhatsApp",
+    "shortDescription": "Read WhatsApp and coordinate guarded messages",
+    "longDescription": "Use Apple Contacts and exact phone matching to resolve people safely, then use the installed whatsapp CLI and local bridge to read targeted conversation context, inspect media, create reviewable drafts, and send one disclosed agent-authored message when the user gives a clear one-message send command.",
+    "developerName": "PedroAVJ",
+    "category": "Communication",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://www.whatsapp.com/",
+    "privacyPolicyURL": "https://www.whatsapp.com/legal/privacy-policy",
+    "termsOfServiceURL": "https://www.whatsapp.com/legal/terms-of-service",
+    "defaultPrompt": [
+      "List recent WhatsApp chats",
+      "Read this WhatsApp conversation",
+      "Handle this WhatsApp follow-up for me"
+    ],
+    "brandColor": "#25D366",
+    "composerIcon": "./assets/whatsapp-icon.svg",
+    "logo": "./assets/whatsapp-icon.svg",
+    "screenshots": []
+  }
+}

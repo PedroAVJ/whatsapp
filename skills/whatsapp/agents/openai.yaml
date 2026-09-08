@@ -1,0 +1,9 @@
+interface:
+  display_name: "WhatsApp"
+  short_description: "Use the installed WhatsApp CLI"
+  icon_small: "./assets/whatsapp-icon.svg"
+  icon_large: "./assets/whatsapp-icon.svg"
+  brand_color: "#25D366"
+  default_prompt: "Use $whatsapp to read my latest WhatsApp message through the installed CLI."
+policy:
+  allow_implicit_invocation: true
