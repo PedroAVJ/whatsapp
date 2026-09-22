@@ -209,6 +209,17 @@ test("bridge admin and direct CLI scripts exist", () => {
   }
 });
 
+test("bridge health requires a live logged-in WhatsApp connection", () => {
+  const commonEnv = fs.readFileSync(
+    path.join(pluginRoot, "scripts", "common_env.sh"),
+    "utf8",
+  );
+
+  assert.match(commonEnv, /data\.get\("ok"\)/);
+  assert.match(commonEnv, /data\.get\("connected"\)/);
+  assert.match(commonEnv, /data\.get\("logged_in"\)/);
+});
+
 test("vendored upstream MCP exposes only read-only tools", () => {
   const mainPy = fs.readFileSync(
     path.join(pluginRoot, "vendor", "lharries-whatsapp-mcp", "whatsapp-mcp-server", "main.py"),
@@ -410,7 +421,7 @@ test("whatsapp plugin versions stay synchronized", () => {
   );
   const pkg = JSON.parse(fs.readFileSync(path.join(pluginRoot, "package.json"), "utf8"));
 
-  assert.equal(codexManifest.version, "0.11.10");
+  assert.equal(codexManifest.version, "0.11.11");
   assert.equal(claudeManifest.version, codexManifest.version);
   assert.equal(pkg.version, codexManifest.version);
 });
