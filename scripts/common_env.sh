@@ -193,7 +193,13 @@ url = f"http://127.0.0.1:{port}/api/health"
 try:
     with urllib.request.urlopen(url, timeout=1) as response:
         data = json.load(response)
-        sys.exit(0 if data.get("ok") else 1)
+        sys.exit(
+            0
+            if data.get("ok")
+            and data.get("connected")
+            and data.get("logged_in")
+            else 1
+        )
 except Exception:
     sys.exit(1)
 PY
