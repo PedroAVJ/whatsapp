@@ -35,6 +35,14 @@ func TestConfigureFullHistorySyncRequestsFullHistory(t *testing.T) {
 	}
 }
 
+func TestExtractDirectPathFromURLPreservesQuery(t *testing.T) {
+	got := extractDirectPathFromURL("https://mmg.whatsapp.net/o1/v/t24/image.enc?ccb=9-4&oh=token")
+	want := "/o1/v/t24/image.enc?ccb=9-4&oh=token"
+	if got != want {
+		t.Fatalf("extractDirectPathFromURL() = %q, want %q", got, want)
+	}
+}
+
 func TestFullHistorySyncCompletedRequiresFullAtOneHundredPercent(t *testing.T) {
 	fullNinetyNine := &events.HistorySync{Data: &waHistorySync.HistorySync{
 		SyncType: waHistorySync.HistorySync_FULL.Enum(),
