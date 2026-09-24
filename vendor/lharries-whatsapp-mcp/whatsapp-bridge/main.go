@@ -1904,10 +1904,8 @@ func extractDirectPathFromURL(url string) string {
 
 	pathPart := parts[1]
 
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
+	// Whatsmeow appends download parameters to the direct path with '&', so
+	// preserve the URL's query string (including the initial '?').
 	return "/" + pathPart
 }
 
