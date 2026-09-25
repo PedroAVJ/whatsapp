@@ -91,7 +91,7 @@ whatsapp --json messages send --chat-jid "15551234567@s.whatsapp.net" --reply-to
 
 ## Drafts And Sending
 
-Drafts are local CLI drafts, not native WhatsApp UI drafts. They are stored in `drafts.db` next to the bridge's message database, or at `WHATSAPP_DRAFTS_DB_PATH` when that environment variable is set. A local draft does not create the green `Draft:` label inside WhatsApp itself.
+Drafts are local CLI drafts, not native WhatsApp UI drafts. They are stored in `drafts.db` in the bridge's local store directory, or at `WHATSAPP_DRAFTS_DB_PATH` when that environment variable is set. A local draft does not create the green `Draft:` label inside WhatsApp itself.
 
 Live sends are guarded:
 
@@ -106,7 +106,7 @@ Live sends are guarded:
 
 `media transcribe` is opt-in for one requested audio message. It downloads that
 message's media, calls the ElevenLabs Scribe helper only on a cache miss, and
-stores the transcript in `transcripts.db` next to the bridge message database
+stores the transcript in `transcripts.db` in the bridge's local store directory
 or at `WHATSAPP_TRANSCRIPTS_DB_PATH` when set.
 
 Local state is private by construction and on migration: state and transcript

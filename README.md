@@ -7,7 +7,7 @@ or searching for a separate native tool. The plugin combines the live
 mechanism, automatic voice-note transcription, guarded user-voice drafts,
 approval-gated disclosed messages, and source-hygiene review.
 
-This is not a thin MCP wrapper. It packages a local WhatsApp bridge, a SQLite-backed message store, a stable `whatsapp --json ...` CLI, local reviewable drafts, and guarded live sends. Person-scoped outbound work resolves identity through live Apple Contacts and exact phone matching before a live send. Read-only lookup may identify the relevant conversation from bounded recent chat metadata and message context. User-voice sends require approval of the exact recipient and text. A clear one-message instruction to send, tell, ask, reply, or let a recipient know something authorizes one agent-composed disclosed message even when the user leaves the exact wording to the agent. Draft-only requests and broad continuing delegation do not authorize live sends or future follow-ups. Any direct chat the user identifies as their girlfriend, wife, spouse, or romantic partner defaults to the disclosed agent template and marker; user-voice mode requires an explicit objective-scoped opt-in, and the template default never permits automatic sending.
+This is not a thin MCP wrapper. It packages a local WhatsApp bridge, reads of WhatsApp data from Near's Convex store, a stable `whatsapp --json ...` CLI, local reviewable drafts, and guarded live sends. Person-scoped outbound work resolves identity through live Apple Contacts and exact phone matching before a live send. Read-only lookup may identify the relevant conversation from bounded recent chat metadata and message context. User-voice sends require approval of the exact recipient and text. A clear one-message instruction to send, tell, ask, reply, or let a recipient know something authorizes one agent-composed disclosed message even when the user leaves the exact wording to the agent. Draft-only requests and broad continuing delegation do not authorize live sends or future follow-ups. Any direct chat the user identifies as their girlfriend, wife, spouse, or romantic partner defaults to the disclosed agent template and marker; user-voice mode requires an explicit objective-scoped opt-in, and the template default never permits automatic sending.
 
 The bridge is based on a patched vendored copy of [`lharries/whatsapp-mcp`](https://github.com/lharries/whatsapp-mcp). Native MCP registration is intentionally disabled by default because direct CLI calls are more reliable for coding agents and avoid tool-routing collisions.
 
@@ -16,8 +16,8 @@ This project is unofficial and is not affiliated with WhatsApp or Meta.
 ## What You Get
 
 - Local WhatsApp linked-device bridge.
-- SQLite-backed reads over contacts, chats, messages, reactions, read receipts,
-  context, and media.
+- Reads over contacts, chats, messages, reactions, read receipts, context, and
+  media metadata from Near's Convex deployment (`WHATSAPP_CONVEX_URL`).
 - A composable JSON CLI designed for agents: `whatsapp --json ...`.
 - Arrival-triggered ElevenLabs transcription of incoming audio with a local SQLite
   transcript cache, so voice notes are already readable before an agent asks.
@@ -179,6 +179,13 @@ whatsapp --json media transcribe MESSAGE_ID "15551234567@s.whatsapp.net" --langu
 whatsapp --json media transcripts show MESSAGE_ID --chat-jid "15551234567@s.whatsapp.net"
 ```
 
+`messages list --query TEXT` runs Convex full-text search over message content
+and then keeps messages whose content contains the text (case-insensitive).
+Because the search index matches whole words and prefixes, a fragment inside a
+word can miss messages that a plain substring search would have found.
+`chats list --query` still matches any part of a chat's name, JID, or phone
+number.
+
 `messages list` and `messages context` include reaction and receipt metadata on
 each message when the bridge has observed it. Reactions are exposed as
 `reactions`; receipts are exposed as `receipts`, with `seen_by` as a convenience
@@ -291,12 +298,14 @@ Runtime state is stored outside the repo by default:
 ~/.local/share/codex-whatsapp/
 ```
 
-That directory contains local SQLite databases, bridge logs, QR files, and linked-device state. It is intentionally not part of the repository. Lifecycle commands migrate the state root and every state subdirectory to mode `0700`, migrate regular state files to `0600`, and start the bridge under umask `077`. The direct CLI applies the same protection to draft and transcript state, including custom database paths.
+WhatsApp chats, messages, reactions, receipts, and the LID/phone identity map are read from Near's Convex deployment, not from this directory. It contains the local drafts and transcript SQLite databases, bridge logs, QR files, and linked-device state. It is intentionally not part of the repository. Lifecycle commands migrate the state root and every state subdirectory to mode `0700`, migrate regular state files to `0600`, and start the bridge under umask `077`. The direct CLI applies the same protection to draft and transcript state, including custom database paths.
 
 Important environment variables:
 
 - `WHATSAPP_PLUGIN_STATE_ROOT`: override the local state root.
 - `WHATSAPP_SOURCE_ROOT`: point the CLI at a different plugin checkout.
+- `WHATSAPP_CONVEX_URL`: the Convex deployment WhatsApp data is read from (default `http://127.0.0.1:3210`).
+- `WHATSAPP_CONVEX_READ_TOKEN`: the Convex read token; when unset it is read from the macOS Keychain (account `near`, service `n4.convex-read`).
 - `WHATSAPP_DRAFTS_DB_PATH`: override the local drafts database path.
 - `WHATSAPP_TRANSCRIPTS_DB_PATH`: override the local audio transcript cache database path.
 - `ELEVENLABS_TRANSCRIBE_SCRIPT`: override the ElevenLabs Scribe helper path used by `media transcribe`.

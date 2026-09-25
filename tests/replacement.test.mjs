@@ -247,7 +247,6 @@ test("upstream backend is patched for local state env vars", () => {
     "utf8",
   );
 
-  assert.match(whatsappPy, /WHATSAPP_MCP_MESSAGES_DB_PATH/);
   assert.match(whatsappPy, /WHATSAPP_MCP_API_BASE_URL/);
   assert.match(bridgeGo, /WHATSAPP_MCP_STORE_DIR/);
   assert.match(bridgeGo, /WHATSAPP_MCP_HTTP_PORT/);
@@ -307,7 +306,7 @@ test("reply metadata is persisted and exposed by the vendored backend", () => {
   assert.match(whatsappPy, /reply_to_sender: Optional\[str\] = None/);
   assert.match(whatsappPy, /reply_preview: Optional\[str\] = None/);
   assert.match(whatsappPy, /reply_media_type: Optional\[str\] = None/);
-  assert.match(whatsappPy, /LEFT JOIN messages AS reply_target/);
+  assert.match(whatsappPy, /reply_preview=row\.get\("replyContent"\)/);
 });
 
 test("bridge send endpoint supports outbound quoted replies", () => {
@@ -527,331 +526,123 @@ test("only permanently unavailable audio leaves automatic reconciliation", () =>
   assert.match(readme, /--retry-failed/);
 });
 
-test("list_messages returns structured reply metadata", () => {
-  const mcpServerDir = path.join(
-    pluginRoot,
-    "vendor",
-    "lharries-whatsapp-mcp",
-    "whatsapp-mcp-server",
-  );
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "whatsapp-mcp-test-"));
-  const tempDbPath = path.join(tempDir, "messages.db");
-  const pythonScript = `
-import json
-import os
-import sqlite3
-from whatsapp import list_messages
+const mcpServerDir = path.join(pluginRoot, "vendor", "lharries-whatsapp-mcp", "whatsapp-mcp-server");
 
-db_path = os.environ["WHATSAPP_MCP_MESSAGES_DB_PATH"]
-conn = sqlite3.connect(db_path)
-cursor = conn.cursor()
-cursor.execute("CREATE TABLE chats (jid TEXT PRIMARY KEY, name TEXT, last_message_time TEXT)")
-cursor.execute("""
-CREATE TABLE messages (
-    id TEXT PRIMARY KEY,
-    chat_jid TEXT NOT NULL,
-    sender TEXT NOT NULL,
-    content TEXT,
-    timestamp TEXT NOT NULL,
-    is_from_me INTEGER NOT NULL,
-    media_type TEXT,
-    reply_to_message_id TEXT,
-    reply_to_sender TEXT,
-    reply_to_content TEXT,
-    reply_to_media_type TEXT
-)
-""")
-cursor.execute(
-    "INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
-    ("chat@g.us", "Example Launch", "2026-04-09T12:50:14-05:00"),
-)
-cursor.executemany(
-    """
-    INSERT INTO messages (
-        id,
-        chat_jid,
-        sender,
-        content,
-        timestamp,
-        is_from_me,
-        media_type,
-        reply_to_message_id,
-        reply_to_sender,
-        reply_to_content,
-        reply_to_media_type
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """,
-    [
-        (
-            "orig-1",
-            "chat@g.us",
-            "99900123456789",
-            "The uploaded image is getting cropped",
-            "2026-04-09T12:09:15-05:00",
-            0,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ),
-        (
-            "reply-1",
-            "chat@g.us",
-            "99900987654321",
-            "I'll check that.",
-            "2026-04-09T12:15:18-05:00",
-            1,
-            None,
-            "orig-1",
-            "99900123456789",
-            "The uploaded image is getting cropped",
-            None,
+// Run Python against the vendored backend with Convex's HTTP API faked in-process
+// (tests/fake_convex.py), so no live deployment is needed.
+function runBackendPython(script) {
+  const output = execFileSync("uv", ["run", "python", "-c", script], {
+    cwd: mcpServerDir,
+    encoding: "utf8",
+    env: { ...process.env, PYTHONPATH: path.join(pluginRoot, "tests") },
+  });
+  return JSON.parse(output.trim());
+}
+
+test("list_messages returns structured reply metadata", () => {
+  const parsed = runBackendPython(`
+import json
+from fake_convex import install, message_row, ms
+calls = install({
+    "identity": lambda args: {"chats": [{"jid": "chat@g.us", "name": "Example Launch"}], "lids": [], "self": None},
+    "messages": lambda args: [
+        message_row(
+            id="reply-1", chatJid="chat@g.us", chatName="Example Launch", sender="99900987654321",
+            content="I'll check that.", timestamp=ms("2026-04-09T12:15:18-05:00"), isFromMe=True,
+            replyToMessageId="orig-1", replySender="99900123456789",
+            replyContent="The uploaded image is getting cropped",
         ),
     ],
-)
-conn.commit()
-conn.close()
+})
+from whatsapp import list_messages
 
-messages = list_messages(chat_jid="chat@g.us", include_context=False, limit=10, page=0)
+messages = list_messages(chat_jid="chat@g.us", include_context=False, limit=10, page=2)
 print(json.dumps({
     "type": type(messages).__name__,
     "items": [message.__dict__ for message in messages],
+    "calls": calls,
 }, default=str))
-`;
+`);
 
-  const output = execFileSync(
-    "uv",
-    ["run", "python", "-c", pythonScript],
-    {
-      cwd: mcpServerDir,
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        WHATSAPP_MCP_MESSAGES_DB_PATH: tempDbPath,
-      },
-    },
-  );
-
-  const parsed = JSON.parse(output.trim());
   assert.equal(parsed.type, "list");
-  assert.equal(Array.isArray(parsed.items), true);
   assert.equal(parsed.items[0].reply_to_message_id, "orig-1");
-  assert.equal(
-    parsed.items[0].reply_preview,
-    "The uploaded image is getting cropped",
-  );
+  assert.equal(parsed.items[0].reply_to_sender, "99900123456789");
+  assert.equal(parsed.items[0].reply_preview, "The uploaded image is getting cropped");
+  assert.equal(parsed.items[0].is_from_me, 1, "booleans keep the 0/1 shape the CLI always emitted");
+  assert.match(parsed.items[0].timestamp, /[+-]\d\d:\d\d$/, "times are timezone-aware");
+  assert.equal(Date.parse(parsed.items[0].timestamp.replace(" ", "T")), Date.parse("2026-04-09T12:15:18-05:00"));
+  const messagesCall = parsed.calls.find(([name]) => name === "messages");
+  assert.deepEqual(messagesCall[1], { chatJids: ["chat@g.us"], limit: 10, offset: 20 });
 });
 
 test("list_messages returns reactions and read receipts as structured data", () => {
-  const mcpServerDir = path.join(
-    pluginRoot,
-    "vendor",
-    "lharries-whatsapp-mcp",
-    "whatsapp-mcp-server",
-  );
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "whatsapp-mcp-reactions-test-"));
-  const tempDbPath = path.join(tempDir, "messages.db");
-  const pythonScript = `
+  const parsed = runBackendPython(`
 import json
-import os
-import sqlite3
 from dataclasses import asdict
+from fake_convex import install, message_row, ms
+install({
+    "identity": lambda args: {"chats": [], "lids": [], "self": None},
+    "messages": lambda args: [
+        message_row(
+            id="out-1", chatJid="chat@s.whatsapp.net", chatName="Example", sender="me",
+            content="Please review this", timestamp=ms("2026-04-09T12:15:18-05:00"), isFromMe=True,
+            reactions=[{
+                "sender": "15551230001@s.whatsapp.net", "emoji": "+1", "timestamp": ms("2026-04-09T12:16:18-05:00"),
+                "reactionMessageId": "react-1", "targetMessageId": "out-1", "targetSender": "me",
+                "groupingKey": "grp", "senderTimestampMs": 1775747718000.0, "isFromMe": False,
+            }],
+            receipts=[
+                {"sender": "15551230001@s.whatsapp.net", "type": "delivered", "timestamp": ms("2026-04-09T12:16:00-05:00"),
+                 "messageId": "out-1", "chatJid": "chat@s.whatsapp.net", "messageSender": None},
+                {"sender": "15551230001@s.whatsapp.net", "type": "read", "timestamp": ms("2026-04-09T12:17:18-05:00"),
+                 "messageId": "out-1", "chatJid": "chat@s.whatsapp.net", "messageSender": "me"},
+            ],
+        ),
+    ],
+})
 from whatsapp import list_messages
 
-db_path = os.environ["WHATSAPP_MCP_MESSAGES_DB_PATH"]
-conn = sqlite3.connect(db_path)
-cursor = conn.cursor()
-cursor.execute("CREATE TABLE chats (jid TEXT PRIMARY KEY, name TEXT, last_message_time TEXT)")
-cursor.execute("""
-CREATE TABLE messages (
-    id TEXT,
-    chat_jid TEXT NOT NULL,
-    sender TEXT NOT NULL,
-    content TEXT,
-    timestamp TEXT NOT NULL,
-    is_from_me INTEGER NOT NULL,
-    media_type TEXT,
-    reply_to_message_id TEXT,
-    reply_to_sender TEXT,
-    reply_to_content TEXT,
-    reply_to_media_type TEXT,
-    PRIMARY KEY (id, chat_jid)
-)
-""")
-cursor.execute("""
-CREATE TABLE message_reactions (
-    chat_jid TEXT NOT NULL,
-    target_message_id TEXT NOT NULL,
-    target_sender TEXT NOT NULL DEFAULT '',
-    reaction_sender TEXT NOT NULL,
-    emoji TEXT NOT NULL,
-    reaction_message_id TEXT,
-    grouping_key TEXT,
-    sender_timestamp_ms INTEGER,
-    timestamp TEXT,
-    is_from_me INTEGER,
-    PRIMARY KEY (chat_jid, target_message_id, reaction_sender)
-)
-""")
-cursor.execute("""
-CREATE TABLE message_receipts (
-    message_id TEXT NOT NULL,
-    chat_jid TEXT NOT NULL,
-    receipt_type TEXT NOT NULL,
-    receipt_sender TEXT NOT NULL,
-    message_sender TEXT NOT NULL DEFAULT '',
-    timestamp TEXT,
-    PRIMARY KEY (message_id, chat_jid, receipt_type, receipt_sender, message_sender)
-)
-""")
-cursor.execute(
-    "INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
-    ("chat@s.whatsapp.net", "Example", "2026-04-09T12:50:14-05:00"),
-)
-cursor.execute(
-    """
-    INSERT INTO messages (
-        id, chat_jid, sender, content, timestamp, is_from_me, media_type,
-        reply_to_message_id, reply_to_sender, reply_to_content, reply_to_media_type
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """,
-    ("out-1", "chat@s.whatsapp.net", "me", "Please review this", "2026-04-09T12:15:18-05:00", 1, None, None, None, None, None),
-)
-cursor.execute(
-    """
-    INSERT INTO message_reactions (
-        chat_jid, target_message_id, target_sender, reaction_sender, emoji,
-        reaction_message_id, grouping_key, sender_timestamp_ms, timestamp, is_from_me
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """,
-    ("chat@s.whatsapp.net", "out-1", "me", "15551230001@s.whatsapp.net", "+1", "react-1", "grp", 1775747718000, "2026-04-09T12:16:18-05:00", 0),
-)
-cursor.execute(
-    """
-    INSERT INTO message_receipts (
-        message_id, chat_jid, receipt_type, receipt_sender, message_sender, timestamp
-    ) VALUES (?, ?, ?, ?, ?, ?)
-    """,
-    ("out-1", "chat@s.whatsapp.net", "read", "15551230001@s.whatsapp.net", "me", "2026-04-09T12:17:18-05:00"),
-)
-conn.commit()
-conn.close()
-
 messages = list_messages(chat_jid="chat@s.whatsapp.net", include_context=False, limit=10, page=0)
-print(json.dumps({
-    "items": [asdict(message) for message in messages],
-}, default=str))
-`;
+print(json.dumps({"items": [asdict(message) for message in messages]}, default=str))
+`);
 
-  const output = execFileSync(
-    "uv",
-    ["run", "python", "-c", pythonScript],
-    {
-      cwd: mcpServerDir,
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        WHATSAPP_MCP_MESSAGES_DB_PATH: tempDbPath,
-      },
-    },
-  );
-
-  const parsed = JSON.parse(output.trim());
-  assert.equal(parsed.items[0].reactions.length, 1);
-  assert.equal(parsed.items[0].reactions[0].emoji, "+1");
-  assert.equal(parsed.items[0].reactions[0].sender, "15551230001@s.whatsapp.net");
-  assert.equal(parsed.items[0].receipts.length, 1);
-  assert.equal(parsed.items[0].receipts[0].type, "read");
-  assert.equal(parsed.items[0].seen_by.length, 1);
-  assert.equal(parsed.items[0].seen_by[0].sender, "15551230001@s.whatsapp.net");
+  const [message] = parsed.items;
+  assert.equal(message.reactions.length, 1);
+  assert.equal(message.reactions[0].emoji, "+1");
+  assert.equal(message.reactions[0].sender, "15551230001@s.whatsapp.net");
+  assert.equal(message.reactions[0].sender_timestamp_ms, 1775747718000);
+  assert.equal(message.reactions[0].is_from_me, false);
+  assert.equal(message.receipts.length, 2);
+  assert.deepEqual(message.receipts.map((receipt) => receipt.type), ["delivered", "read"]);
+  assert.equal(message.seen_by.length, 1);
+  assert.equal(message.seen_by[0].sender, "15551230001@s.whatsapp.net");
+  assert.equal(message.seen_by[0].message_sender, "me");
 });
 
 test("list_messages merges phone and LID histories for one contact by default", () => {
-  const mcpServerDir = path.join(
-    pluginRoot,
-    "vendor",
-    "lharries-whatsapp-mcp",
-    "whatsapp-mcp-server",
-  );
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "whatsapp-mcp-identity-test-"));
-  const tempDbPath = path.join(tempDir, "messages.db");
-  const pythonScript = `
+  const parsed = runBackendPython(`
 import json
-import os
-import sqlite3
+from fake_convex import install, message_row, ms
+rows = [
+    message_row(id="new-1", chatJid="99900123456789@lid", chatName="unresolved-lid", sender="99900123456789",
+                content="new one", timestamp=ms("2026-05-20T21:58:17-05:00")),
+    message_row(id="old-2", chatJid="15551230001@s.whatsapp.net", chatName="Acme Ops", sender="me",
+                content="old two", timestamp=ms("2026-05-14T18:15:57-05:00"), isFromMe=True),
+    message_row(id="old-1", chatJid="15551230001@s.whatsapp.net", chatName="Acme Ops", sender="15551230001",
+                content="old one", timestamp=ms("2026-05-14T18:14:57-05:00")),
+]
+calls = install({
+    "identity": lambda args: {
+        "chats": [
+            {"jid": "15551230001@s.whatsapp.net", "name": "Acme Ops"},
+            {"jid": "99900123456789@lid", "name": "unresolved-lid"},
+        ],
+        "lids": [{"lid": "99900123456789", "pn": "15551230001"}],
+        "self": "15550000000:1@s.whatsapp.net",
+    },
+    "messages": lambda args: [row for row in rows if row["chatJid"] in args["chatJids"]],
+})
 from whatsapp import list_messages
-
-messages_db_path = os.environ["WHATSAPP_MCP_MESSAGES_DB_PATH"]
-whatsapp_db_path = os.path.join(os.path.dirname(messages_db_path), "whatsapp.db")
-
-conn = sqlite3.connect(messages_db_path)
-cursor = conn.cursor()
-cursor.execute("CREATE TABLE chats (jid TEXT PRIMARY KEY, name TEXT, last_message_time TEXT)")
-cursor.execute("""
-CREATE TABLE messages (
-    id TEXT,
-    chat_jid TEXT NOT NULL,
-    sender TEXT NOT NULL,
-    content TEXT,
-    timestamp TEXT NOT NULL,
-    is_from_me INTEGER NOT NULL,
-    media_type TEXT,
-    reply_to_message_id TEXT,
-    reply_to_sender TEXT,
-    reply_to_content TEXT,
-    reply_to_media_type TEXT,
-    PRIMARY KEY (id, chat_jid)
-)
-""")
-cursor.executemany(
-    "INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
-    [
-        ("15551230001@s.whatsapp.net", "Acme Ops", "2026-05-14T18:14:57-05:00"),
-        ("99900123456789@lid", "unresolved-lid", "2026-05-20T21:58:17-05:00"),
-    ],
-)
-cursor.executemany(
-    """
-    INSERT INTO messages (
-        id, chat_jid, sender, content, timestamp, is_from_me, media_type,
-        reply_to_message_id, reply_to_sender, reply_to_content, reply_to_media_type
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """,
-    [
-        ("old-1", "15551230001@s.whatsapp.net", "15551230001", "old one", "2026-05-14T18:14:57-05:00", 0, None, None, None, None, None),
-        ("old-2", "15551230001@s.whatsapp.net", "me", "old two", "2026-05-14T18:15:57-05:00", 1, None, None, None, None, None),
-        ("new-1", "99900123456789@lid", "99900123456789", "new one", "2026-05-20T21:58:17-05:00", 0, None, None, None, None, None),
-    ],
-)
-conn.commit()
-conn.close()
-
-conn = sqlite3.connect(whatsapp_db_path)
-cursor = conn.cursor()
-cursor.execute("CREATE TABLE whatsmeow_lid_map (lid TEXT PRIMARY KEY, pn TEXT UNIQUE NOT NULL)")
-cursor.execute("""
-CREATE TABLE whatsmeow_contacts (
-    our_jid TEXT,
-    their_jid TEXT,
-    first_name TEXT,
-    full_name TEXT,
-    push_name TEXT,
-    business_name TEXT,
-    redacted_phone TEXT,
-    PRIMARY KEY (our_jid, their_jid)
-)
-""")
-cursor.execute("INSERT INTO whatsmeow_lid_map (lid, pn) VALUES (?, ?)", ("99900123456789", "15551230001"))
-cursor.executemany(
-    "INSERT INTO whatsmeow_contacts (our_jid, their_jid, first_name, full_name, push_name, business_name, redacted_phone) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    [
-        ("me@s.whatsapp.net", "15551230001@s.whatsapp.net", None, "Acme Ops", "Acme Ops", None, None),
-        ("me@s.whatsapp.net", "99900123456789@lid", None, None, "Acme Ops", None, None),
-    ],
-)
-conn.commit()
-conn.close()
 
 merged = list_messages(chat_jid="99900123456789@lid", include_context=False, limit=10, page=0)
 merged_from_phone = list_messages(chat_jid="15551230001@s.whatsapp.net", include_context=False, limit=10, page=0)
@@ -860,27 +651,144 @@ print(json.dumps({
     "merged": [message.__dict__ for message in merged],
     "merged_from_phone": [message.__dict__ for message in merged_from_phone],
     "exact": [message.__dict__ for message in exact],
+    "chat_jids": [args["chatJids"] for name, args in calls if name == "messages"],
 }, default=str))
-`;
+`);
 
-  const output = execFileSync(
-    "uv",
-    ["run", "python", "-c", pythonScript],
-    {
-      cwd: mcpServerDir,
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        WHATSAPP_MCP_MESSAGES_DB_PATH: tempDbPath,
-      },
-    },
-  );
-
-  const parsed = JSON.parse(output.trim());
+  assert.deepEqual(parsed.chat_jids, [
+    ["99900123456789@lid", "15551230001@s.whatsapp.net"],
+    ["15551230001@s.whatsapp.net", "99900123456789@lid"],
+    ["99900123456789@lid"],
+  ]);
   assert.deepEqual(parsed.merged.map((message) => message.id), ["new-1", "old-2", "old-1"]);
   assert.deepEqual(parsed.merged_from_phone.map((message) => message.id), ["new-1", "old-2", "old-1"]);
   assert.deepEqual(parsed.merged.map((message) => message.chat_name), ["Acme Ops", "Acme Ops", "Acme Ops"]);
   assert.deepEqual(parsed.exact.map((message) => message.id), ["new-1"]);
+});
+
+test("list_chats filters, sorts, and pages Convex chats client-side", () => {
+  const parsed = runBackendPython(`
+import json
+from fake_convex import install, ms
+chats = [
+    {"jid": "99900123456789@lid", "name": "99900123456789", "lastMessageTime": ms("2026-05-20T21:58:17-05:00"),
+     "lastMessage": "hi", "lastSender": "99900123456789", "lastIsFromMe": False},
+    {"jid": "group@g.us", "name": "Acme Launch", "lastMessageTime": ms("2026-05-19T10:00:00-05:00"),
+     "lastMessage": None, "lastSender": None, "lastIsFromMe": None},
+    {"jid": "15559990000@s.whatsapp.net", "name": "Zed", "lastMessageTime": None,
+     "lastMessage": None, "lastSender": None, "lastIsFromMe": None},
+]
+calls = install({
+    "identity": lambda args: {"chats": [{"jid": "15551230001@s.whatsapp.net", "name": "Acme Ops"}],
+                              "lids": [{"lid": "99900123456789", "pn": "15551230001"}], "self": None},
+    "chats": lambda args: chats,
+})
+from whatsapp import list_chats
+
+def view(result):
+    return [[chat.jid, chat.name, chat.last_message_time, chat.last_is_from_me] for chat in result]
+
+print(json.dumps({
+    "active": view(list_chats(limit=2, page=0)),
+    "active_page_2": view(list_chats(limit=2, page=1)),
+    "acme_by_name": view(list_chats(query="acme", sort_by="name")),
+    "by_phone": view(list_chats(query="1555123", include_last_message=False)),
+    "include_last": [args["includeLast"] for name, args in calls if name == "chats"],
+}, default=str))
+`);
+
+  assert.deepEqual(parsed.active.map(([jid]) => jid), ["99900123456789@lid", "group@g.us"]);
+  assert.equal(parsed.active[0][1], "Acme Ops", "a LID chat takes its mapped phone chat's name");
+  assert.equal(parsed.active[0][3], 0);
+  assert.equal(Date.parse(parsed.active[0][2].replace(" ", "T")), Date.parse("2026-05-20T21:58:17-05:00"));
+  assert.deepEqual(parsed.active_page_2, [["15559990000@s.whatsapp.net", "Zed", null, null]]);
+  assert.deepEqual(parsed.acme_by_name.map(([, name]) => name), ["Acme Launch", "Acme Ops"]);
+  assert.deepEqual(parsed.by_phone.map(([jid]) => jid), ["99900123456789@lid"]);
+  assert.deepEqual(parsed.include_last, [true, true, true, false]);
+});
+
+test("backend reads map Convex rows and surface Convex failures", () => {
+  const parsed = runBackendPython(`
+import json
+import convex_client
+from fake_convex import install, message_row, ms
+row = message_row(id="m-1", chatJid="chat@g.us", chatName="Team", sender="15551230001@s.whatsapp.net",
+                  content="hello", timestamp=ms("2026-04-09T12:15:18-05:00"))
+calls = install({
+    "identity": lambda args: {"chats": [], "lids": [], "self": None},
+    "messages": lambda args: [],
+    "context": lambda args: None if args["id"] == "missing" else {"message": row, "before": [], "after": []},
+    "chat": lambda args: {"jid": args["jid"], "name": "Team", "lastMessageTime": ms("2026-04-09T12:15:18-05:00"),
+                          "lastMessage": "hello", "lastSender": "x", "lastIsFromMe": True},
+    "contacts": lambda args: [{"jid": "15551230001@s.whatsapp.net", "name": "Alice"}],
+    "contactChats": lambda args: [],
+    "directChat": lambda args: None,
+    "lastInteraction": lambda args: row,
+    "senderName": lambda args: "Alice",
+})
+import whatsapp
+
+out = {}
+whatsapp.list_messages(after="2026-04-09T00:00:00-05:00", before="2026-04-10T00:00:00-05:00",
+                       sender_phone_number="15551230001", query="Hello", include_context=False)
+out["context"] = whatsapp.get_message_context("m-1", before=2, after=3).message.id
+try:
+    whatsapp.get_message_context("missing")
+except ValueError as exc:
+    out["missing"] = str(exc)
+out["chat"] = whatsapp.get_chat("chat@g.us", include_last_message=False).last_is_from_me
+out["contacts"] = [[c.phone_number, c.name, c.jid] for c in whatsapp.search_contacts("ali")]
+whatsapp.get_contact_chats("15551230001@s.whatsapp.net", limit=5, page=3)
+out["direct"] = whatsapp.get_direct_chat_by_contact("1555")
+out["last"] = whatsapp.get_last_interaction("15551230001@s.whatsapp.net")
+out["calls"] = calls
+try:
+    convex_client.query("notAFunction")
+except convex_client.ConvexError as exc:
+    out["error"] = str(exc)
+print(json.dumps(out, default=str))
+`);
+
+  const args = Object.fromEntries(parsed.calls.map(([name, callArgs]) => [name, callArgs]));
+  assert.deepEqual(args.messages, {
+    limit: 20,
+    offset: 0,
+    after: Date.parse("2026-04-09T00:00:00-05:00"),
+    before: Date.parse("2026-04-10T00:00:00-05:00"),
+    sender: "15551230001",
+    query: "Hello",
+  });
+  assert.equal(parsed.context, "m-1");
+  assert.deepEqual(
+    parsed.calls.filter(([name]) => name === "context").map(([, callArgs]) => callArgs),
+    [{ id: "m-1", before: 2, after: 3 }, { id: "missing", before: 5, after: 5 }],
+  );
+  assert.equal(parsed.missing, "Message with ID missing not found");
+  assert.equal(parsed.chat, 1);
+  assert.deepEqual(args.chat, { jid: "chat@g.us", includeLast: false });
+  assert.deepEqual(parsed.contacts, [["15551230001", "Alice", "15551230001@s.whatsapp.net"]]);
+  assert.deepEqual(args.contacts, { query: "ali" });
+  assert.deepEqual(args.contactChats, { jid: "15551230001@s.whatsapp.net", limit: 5, offset: 15 });
+  assert.equal(parsed.direct, null);
+  assert.deepEqual(args.directChat, { phone: "1555" });
+  assert.match(parsed.last, /Chat: Team From: Alice: hello/);
+  assert.match(parsed.error, /Convex query whatsapp:notAFunction failed: Could not find function/);
+});
+
+test("the backend reads WhatsApp data from Convex, not SQLite", () => {
+  const whatsappPy = fs.readFileSync(path.join(mcpServerDir, "whatsapp.py"), "utf8");
+  const convexClient = fs.readFileSync(path.join(mcpServerDir, "convex_client.py"), "utf8");
+  const backendCli = fs.readFileSync(path.join(pluginRoot, "scripts", "whatsapp_cli.py"), "utf8");
+  const cli = fs.readFileSync(path.join(pluginRoot, "cli", "whatsapp_cli.py"), "utf8");
+
+  assert.doesNotMatch(whatsappPy, /sqlite3/);
+  assert.doesNotMatch(whatsappPy, /MESSAGES_DB_PATH/);
+  assert.doesNotMatch(backendCli, /db-path/);
+  assert.doesNotMatch(cli, /db-path|messages_db_path|whatsmeow_lid_map/);
+  assert.match(convexClient, /WHATSAPP_CONVEX_URL/);
+  assert.match(convexClient, /WHATSAPP_CONVEX_READ_TOKEN/);
+  assert.match(convexClient, /n4\.convex-read/);
+  assert.match(backendCli, /"store-info"/);
 });
 
 test("CLI exposes direct code-backed access without MCP registration", () => {
@@ -900,83 +808,27 @@ test("CLI exposes direct code-backed access without MCP registration", () => {
 });
 
 test("list_messages surfaces edited_at so a revised message is not read as original", () => {
-  const mcpServerDir = path.join(
-    pluginRoot,
-    "vendor",
-    "lharries-whatsapp-mcp",
-    "whatsapp-mcp-server",
-  );
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "whatsapp-mcp-edited-test-"));
-  const tempDbPath = path.join(tempDir, "messages.db");
-  const pythonScript = `
+  const parsed = runBackendPython(`
 import json
-import os
-import sqlite3
 from dataclasses import asdict
+from fake_convex import install, message_row, ms
+install({
+    "identity": lambda args: {"chats": [], "lids": [], "self": None},
+    "messages": lambda args: [
+        message_row(id="untouched-1", chatJid="chat@s.whatsapp.net", chatName="Example",
+                    sender="15551230001@s.whatsapp.net", content="never edited",
+                    timestamp=ms("2026-04-09T12:20:18-05:00")),
+        message_row(id="revised-1", chatJid="chat@s.whatsapp.net", chatName="Example",
+                    sender="15551230001@s.whatsapp.net", content="the corrected text",
+                    timestamp=ms("2026-04-09T12:15:18-05:00"), editedAt=ms("2026-04-09T12:16:51-05:00")),
+    ],
+})
 from whatsapp import list_messages
 
-db_path = os.environ["WHATSAPP_MCP_MESSAGES_DB_PATH"]
-conn = sqlite3.connect(db_path)
-cursor = conn.cursor()
-cursor.execute("CREATE TABLE chats (jid TEXT PRIMARY KEY, name TEXT, last_message_time TEXT)")
-cursor.execute("""
-CREATE TABLE messages (
-    id TEXT,
-    chat_jid TEXT NOT NULL,
-    sender TEXT NOT NULL,
-    content TEXT,
-    timestamp TEXT NOT NULL,
-    is_from_me INTEGER NOT NULL,
-    media_type TEXT,
-    reply_to_message_id TEXT,
-    reply_to_sender TEXT,
-    reply_to_content TEXT,
-    reply_to_media_type TEXT,
-    edited_at TEXT,
-    PRIMARY KEY (id, chat_jid)
-)
-""")
-cursor.execute(
-    "INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
-    ("chat@s.whatsapp.net", "Example", "2026-04-09T12:50:14-05:00"),
-)
-cursor.executemany(
-    """
-    INSERT INTO messages (
-        id, chat_jid, sender, content, timestamp, is_from_me, media_type,
-        reply_to_message_id, reply_to_sender, reply_to_content, reply_to_media_type, edited_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """,
-    [
-        ("revised-1", "chat@s.whatsapp.net", "15551230001@s.whatsapp.net", "the corrected text",
-         "2026-04-09T12:15:18-05:00", 0, None, None, None, None, None, "2026-04-09T12:16:51-05:00"),
-        ("untouched-1", "chat@s.whatsapp.net", "15551230001@s.whatsapp.net", "never edited",
-         "2026-04-09T12:20:18-05:00", 0, None, None, None, None, None, None),
-    ],
-)
-conn.commit()
-conn.close()
-
 messages = list_messages(chat_jid="chat@s.whatsapp.net", include_context=False, limit=10, page=0)
-print(json.dumps({
-    "items": {message.id: asdict(message) for message in messages},
-}, default=str))
-`;
+print(json.dumps({"items": {message.id: asdict(message) for message in messages}}, default=str))
+`);
 
-  const output = execFileSync(
-    "uv",
-    ["run", "python", "-c", pythonScript],
-    {
-      cwd: mcpServerDir,
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        WHATSAPP_MCP_MESSAGES_DB_PATH: tempDbPath,
-      },
-    },
-  );
-
-  const parsed = JSON.parse(output.trim());
   assert.equal(parsed.items["revised-1"].content, "the corrected text");
   assert.ok(
     parsed.items["revised-1"].edited_at,

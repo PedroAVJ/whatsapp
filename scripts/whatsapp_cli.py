@@ -16,6 +16,12 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 WHATSAPP_MODULE_PATH = (
     PLUGIN_ROOT / "vendor" / "lharries-whatsapp-mcp" / "whatsapp-mcp-server" / "whatsapp.py"
 )
+# The bridge's local state directory. WhatsApp data itself lives in Convex; the
+# CLI keeps its own drafts and transcript cache here.
+STORE_DIR = os.environ.get(
+    "WHATSAPP_MCP_STORE_DIR",
+    str(PLUGIN_ROOT / "vendor" / "lharries-whatsapp-mcp" / "whatsapp-bridge" / "store"),
+)
 
 
 def _load_whatsapp_module():
@@ -60,7 +66,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("db-path", help="Print the resolved messages.db path")
+    subparsers.add_parser(
+        "store-info",
+        help="Print the Convex URL WhatsApp data is read from and the local store directory",
+    )
 
     search_contacts = subparsers.add_parser("search-contacts", help="Search contacts by name or phone")
     search_contacts.add_argument("query")
@@ -126,9 +135,17 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     whatsapp = _load_whatsapp_module()
+    try:
+        return run(parser, args, whatsapp)
+    except whatsapp.convex_client.ConvexError as exc:
+        print(f"Convex error: {exc}", file=sys.stderr)
+        return 1
 
-    if args.command == "db-path":
-        _print_json({"messages_db_path": whatsapp.MESSAGES_DB_PATH})
+
+def run(parser: argparse.ArgumentParser, args: argparse.Namespace, whatsapp: Any) -> int:
+
+    if args.command == "store-info":
+        _print_json({"convex_url": whatsapp.convex_client.convex_url(), "store_dir": STORE_DIR})
         return 0
 
     if args.command == "search-contacts":
