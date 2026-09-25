@@ -1,4 +1,3 @@
-import sqlite3
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
@@ -6,15 +5,11 @@ import os.path
 import requests
 import json
 import audio
+import convex_client
 
-DEFAULT_MESSAGES_DB_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    '..',
-    'whatsapp-bridge',
-    'store',
-    'messages.db',
-)
-MESSAGES_DB_PATH = os.environ.get("WHATSAPP_MCP_MESSAGES_DB_PATH", DEFAULT_MESSAGES_DB_PATH)
+# WhatsApp data (chats, messages, reactions, receipts, and the account's
+# LID/phone identity map) is read from Near's Convex deployment; see
+# convex_client.py for the URL and read-token settings.
 WHATSAPP_API_BASE_URL = os.environ.get("WHATSAPP_MCP_API_BASE_URL", "http://127.0.0.1:8080/api")
 
 
@@ -35,12 +30,9 @@ def _is_numeric_label(value):
     return isinstance(value, str) and value.isdigit()
 
 
-def _parse_optional_datetime(value):
-    if value is None or value == "":
-        return None
-    if isinstance(value, datetime):
-        return value
-    return datetime.fromisoformat(value)
+def _flag(value):
+    # The SQLite store reported booleans as 0/1; keep that output shape.
+    return None if value is None else int(bool(value))
 
 
 def _load_identity_context():
@@ -51,49 +43,18 @@ def _load_identity_context():
         "chat_names": {},
     }
 
-    try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT jid, name FROM chats WHERE name IS NOT NULL AND name != ''")
-        for jid, name in cursor.fetchall():
-            if isinstance(jid, str) and isinstance(name, str) and name:
-                context["chat_names"][jid] = name
-    except sqlite3.Error:
-        pass
-    finally:
-        if 'conn' in locals():
-            conn.close()
+    identity = convex_client.query("identity") or {}
+    for chat in identity.get("chats") or []:
+        jid, name = chat.get("jid"), chat.get("name")
+        if isinstance(jid, str) and isinstance(name, str) and name:
+            context["chat_names"][jid] = name
 
-    whatsapp_db_path = os.path.join(os.path.dirname(MESSAGES_DB_PATH), "whatsapp.db")
-    if not os.path.exists(whatsapp_db_path):
-        return context
-
-    try:
-        conn = sqlite3.connect(whatsapp_db_path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT lid, pn FROM whatsmeow_lid_map")
-        for lid, phone in cursor.fetchall():
-            lid_user = _jid_user(lid)
-            phone_user = _jid_user(phone)
-            if lid_user and phone_user and phone_user.isdigit():
-                context["lid_to_phone"][lid_user] = phone_user
-                context["phone_to_lid"][phone_user] = lid_user
-
-        cursor.execute(
-            """
-            SELECT their_jid, full_name, first_name, business_name, push_name
-            FROM whatsmeow_contacts
-            """
-        )
-        for their_jid, full_name, first_name, business_name, push_name in cursor.fetchall():
-            name = _first_text(full_name, first_name, business_name, push_name)
-            if isinstance(their_jid, str) and name:
-                context["contact_names"][their_jid] = name
-    except sqlite3.Error:
-        pass
-    finally:
-        if 'conn' in locals():
-            conn.close()
+    for pair in identity.get("lids") or []:
+        lid_user = _jid_user(pair.get("lid"))
+        phone_user = _jid_user(pair.get("pn"))
+        if lid_user and phone_user and phone_user.isdigit():
+            context["lid_to_phone"][lid_user] = phone_user
+            context["phone_to_lid"][phone_user] = lid_user
 
     return context
 
@@ -232,198 +193,69 @@ class MessageContext:
     after: List[Message]
 
 def get_sender_name(sender_jid: str) -> str:
-    try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
-        cursor = conn.cursor()
-
-        # First try matching by exact JID
-        cursor.execute("""
-            SELECT name
-            FROM chats
-            WHERE jid = ?
-            LIMIT 1
-        """, (sender_jid,))
-
-        result = cursor.fetchone()
-
-        # If no result, try looking for the number within JIDs
-        if not result:
-            # Extract the phone number part if it's a JID
-            if '@' in sender_jid:
-                phone_part = sender_jid.split('@')[0]
-            else:
-                phone_part = sender_jid
-
-            cursor.execute("""
-                SELECT name
-                FROM chats
-                WHERE jid LIKE ?
-                LIMIT 1
-            """, (f"%{phone_part}%",))
-
-            result = cursor.fetchone()
-
-        if result and result[0]:
-            return result[0]
-        else:
-            return sender_jid
-
-    except sqlite3.Error as e:
-        print(f"Database error while getting sender name: {e}")
-        return sender_jid
-    finally:
-        if 'conn' in locals():
-            conn.close()
-
-MESSAGE_SELECT_COLUMNS = """
-    {alias}.timestamp,
-    {alias}.sender,
-    chats.name,
-    {alias}.content,
-    {alias}.is_from_me,
-    chats.jid,
-    {alias}.id,
-    {alias}.media_type,
-    {alias}.reply_to_message_id,
-    COALESCE(NULLIF(reply_target.sender, ''), NULLIF({alias}.reply_to_sender, '')),
-    COALESCE(NULLIF(reply_target.content, ''), NULLIF({alias}.reply_to_content, '')),
-    COALESCE(NULLIF(reply_target.media_type, ''), NULLIF({alias}.reply_to_media_type, '')),
-    {edited_at}
-"""
+    return convex_client.query("senderName", {"jid": sender_jid}) or sender_jid
 
 
-def _column_exists(cursor, table_name: str, column_name: str) -> bool:
-    cursor.execute(f"PRAGMA table_info({table_name})")
-    return any(row[1] == column_name for row in cursor.fetchall())
+def attach_message_metadata(message: Message, row: dict) -> Message:
+    """Map the reactions and receipts Convex returns with a message row."""
+    for reaction in row.get("reactions") or []:
+        sender_timestamp_ms = reaction.get("senderTimestampMs")
+        is_from_me = reaction.get("isFromMe")
+        message.reactions.append(MessageReaction(
+            sender=reaction.get("sender"),
+            emoji=reaction.get("emoji"),
+            timestamp=convex_client.from_ms(reaction.get("timestamp")),
+            reaction_message_id=reaction.get("reactionMessageId"),
+            target_message_id=reaction.get("targetMessageId"),
+            target_sender=reaction.get("targetSender") or None,
+            grouping_key=reaction.get("groupingKey"),
+            sender_timestamp_ms=int(sender_timestamp_ms) if sender_timestamp_ms is not None else None,
+            is_from_me=bool(is_from_me) if is_from_me is not None else None,
+        ))
 
-
-def message_select_columns(alias: str = "messages", has_edited_at: bool = True) -> str:
-    # A store written by a bridge that predates edited_at still reads; the column
-    # simply comes back empty rather than failing every message query.
-    edited_at = f"{alias}.edited_at" if has_edited_at else "NULL"
-    return MESSAGE_SELECT_COLUMNS.format(alias=alias, edited_at=edited_at)
-
-
-def row_to_message(row: Tuple) -> Message:
-    return Message(
-        timestamp=datetime.fromisoformat(row[0]),
-        sender=row[1],
-        chat_name=row[2],
-        content=row[3],
-        is_from_me=row[4],
-        chat_jid=row[5],
-        id=row[6],
-        media_type=row[7],
-        reply_to_message_id=row[8],
-        reply_to_sender=row[9],
-        reply_preview=row[10],
-        reply_media_type=row[11],
-        edited_at=datetime.fromisoformat(row[12]) if row[12] else None,
-    )
-
-
-def _table_exists(cursor, table_name: str) -> bool:
-    cursor.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-        (table_name,),
-    )
-    return cursor.fetchone() is not None
-
-
-def attach_message_metadata(cursor, messages: List[Message]) -> None:
-    if not messages:
-        return
-
-    keys = sorted({(message.chat_jid, message.id) for message in messages})
-    key_to_messages = {}
-    for message in messages:
-        key_to_messages.setdefault((message.chat_jid, message.id), []).append(message)
-
-    if _table_exists(cursor, "message_reactions"):
-        clauses = " OR ".join(["(chat_jid = ? AND target_message_id = ?)"] * len(keys))
-        params = []
-        for chat_jid, message_id in keys:
-            params.extend([chat_jid, message_id])
-
-        cursor.execute(
-            f"""
-            SELECT
-                chat_jid,
-                target_message_id,
-                target_sender,
-                reaction_sender,
-                emoji,
-                reaction_message_id,
-                grouping_key,
-                sender_timestamp_ms,
-                timestamp,
-                is_from_me
-            FROM message_reactions
-            WHERE emoji != '' AND ({clauses})
-            ORDER BY timestamp ASC, reaction_sender ASC
-            """,
-            tuple(params),
+    for receipt_row in row.get("receipts") or []:
+        receipt = MessageReceipt(
+            sender=receipt_row.get("sender"),
+            type=receipt_row.get("type"),
+            timestamp=convex_client.from_ms(receipt_row.get("timestamp")),
+            message_id=receipt_row.get("messageId"),
+            chat_jid=receipt_row.get("chatJid"),
+            message_sender=receipt_row.get("messageSender") or None,
         )
-        for (
-            chat_jid,
-            target_message_id,
-            target_sender,
-            reaction_sender,
-            emoji,
-            reaction_message_id,
-            grouping_key,
-            sender_timestamp_ms,
-            timestamp,
-            is_from_me,
-        ) in cursor.fetchall():
-            reaction = MessageReaction(
-                sender=reaction_sender,
-                emoji=emoji,
-                timestamp=_parse_optional_datetime(timestamp),
-                reaction_message_id=reaction_message_id,
-                target_message_id=target_message_id,
-                target_sender=target_sender or None,
-                grouping_key=grouping_key,
-                sender_timestamp_ms=sender_timestamp_ms,
-                is_from_me=bool(is_from_me) if is_from_me is not None else None,
-            )
-            for message in key_to_messages.get((chat_jid, target_message_id), []):
-                message.reactions.append(reaction)
+        message.receipts.append(receipt)
+        if receipt.type == "read":
+            message.seen_by.append(receipt)
+    return message
 
-    if _table_exists(cursor, "message_receipts"):
-        clauses = " OR ".join(["(chat_jid = ? AND message_id = ?)"] * len(keys))
-        params = []
-        for chat_jid, message_id in keys:
-            params.extend([chat_jid, message_id])
 
-        cursor.execute(
-            f"""
-            SELECT
-                message_id,
-                chat_jid,
-                receipt_type,
-                receipt_sender,
-                message_sender,
-                timestamp
-            FROM message_receipts
-            WHERE {clauses}
-            ORDER BY timestamp ASC, receipt_sender ASC
-            """,
-            tuple(params),
-        )
-        for message_id, chat_jid, receipt_type, receipt_sender, message_sender, timestamp in cursor.fetchall():
-            receipt = MessageReceipt(
-                sender=receipt_sender,
-                type=receipt_type,
-                timestamp=_parse_optional_datetime(timestamp),
-                message_id=message_id,
-                chat_jid=chat_jid,
-                message_sender=message_sender or None,
-            )
-            for message in key_to_messages.get((chat_jid, message_id), []):
-                message.receipts.append(receipt)
-                if receipt.type == "read":
-                    message.seen_by.append(receipt)
+def row_to_message(row: dict) -> Message:
+    message = Message(
+        timestamp=convex_client.from_ms(row["timestamp"]),
+        sender=row["sender"],
+        chat_name=row.get("chatName"),
+        content=row.get("content"),
+        is_from_me=_flag(row.get("isFromMe")),
+        chat_jid=row["chatJid"],
+        id=row["id"],
+        media_type=row.get("mediaType"),
+        reply_to_message_id=row.get("replyToMessageId"),
+        reply_to_sender=row.get("replySender"),
+        reply_preview=row.get("replyContent"),
+        reply_media_type=row.get("replyMediaType"),
+        edited_at=convex_client.from_ms(row.get("editedAt")),
+    )
+    return attach_message_metadata(message, row)
+
+
+def row_to_chat(row: dict) -> Chat:
+    return Chat(
+        jid=row["jid"],
+        name=row.get("name"),
+        last_message_time=convex_client.from_ms(row.get("lastMessageTime")) if row.get("lastMessageTime") else None,
+        last_message=row.get("lastMessage"),
+        last_sender=row.get("lastSender"),
+        last_is_from_me=_flag(row.get("lastIsFromMe")),
+    )
 
 
 def format_reply_prefix(message: Message) -> str:
@@ -490,102 +322,61 @@ def list_messages(
     context_after: int = 1,
     expand_identity: bool = True,
 ) -> List[Message]:
-    """Get messages matching the specified criteria with optional context."""
-    try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
-        cursor = conn.cursor()
-        identity_context = _load_identity_context()
-        has_edited_at = _column_exists(cursor, "messages", "edited_at")
+    """Get messages matching the specified criteria with optional context.
 
-        # Build base query
-        query_parts = [f"SELECT {message_select_columns('messages', has_edited_at)} FROM messages"]
-        query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
-        query_parts.append("LEFT JOIN messages AS reply_target ON reply_target.chat_jid = messages.chat_jid AND reply_target.id = messages.reply_to_message_id")
-        where_clauses = []
-        params = []
+    A text `query` runs Convex full-text search and then keeps messages whose
+    content contains the text (case-insensitive).
+    """
+    identity_context = _load_identity_context()
+    args = {"limit": limit, "offset": page * limit}
 
-        # Add filters
-        if after:
-            try:
-                after = datetime.fromisoformat(after)
-            except ValueError:
-                raise ValueError(f"Invalid date format for 'after': {after}. Please use ISO-8601 format.")
+    if after:
+        try:
+            args["after"] = convex_client.to_ms(datetime.fromisoformat(after))
+        except ValueError:
+            raise ValueError(f"Invalid date format for 'after': {after}. Please use ISO-8601 format.")
 
-            where_clauses.append("messages.timestamp > ?")
-            params.append(after)
+    if before:
+        try:
+            args["before"] = convex_client.to_ms(datetime.fromisoformat(before))
+        except ValueError:
+            raise ValueError(f"Invalid date format for 'before': {before}. Please use ISO-8601 format.")
 
-        if before:
-            try:
-                before = datetime.fromisoformat(before)
-            except ValueError:
-                raise ValueError(f"Invalid date format for 'before': {before}. Please use ISO-8601 format.")
+    if sender_phone_number:
+        args["sender"] = sender_phone_number
 
-            where_clauses.append("messages.timestamp < ?")
-            params.append(before)
+    if chat_jid:
+        args["chatJids"] = (
+            _equivalent_direct_chat_jids(chat_jid, identity_context)
+            if expand_identity
+            else [chat_jid]
+        )
 
-        if sender_phone_number:
-            where_clauses.append("messages.sender = ?")
-            params.append(sender_phone_number)
+    if query:
+        args["query"] = query
 
-        if chat_jid:
-            chat_jids = (
-                _equivalent_direct_chat_jids(chat_jid, identity_context)
-                if expand_identity
-                else [chat_jid]
-            )
-            where_clauses.append(
-                "messages.chat_jid IN (" + ",".join(["?"] * len(chat_jids)) + ")"
-            )
-            params.extend(chat_jids)
+    result = []
+    for row in convex_client.query("messages", args) or []:
+        message = row_to_message(row)
+        message.chat_name = _resolved_chat_name(
+            message.chat_jid,
+            message.chat_name,
+            identity_context,
+        )
+        result.append(message)
 
-        if query:
-            where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
-            params.append(f"%{query}%")
+    if include_context and result:
+        # Add context for each message
+        messages_with_context = []
+        for msg in result:
+            context = get_message_context(msg.id, context_before, context_after)
+            messages_with_context.extend(context.before)
+            messages_with_context.append(context.message)
+            messages_with_context.extend(context.after)
 
-        if where_clauses:
-            query_parts.append("WHERE " + " AND ".join(where_clauses))
+        return messages_with_context
 
-        # Add pagination
-        offset = page * limit
-        query_parts.append("ORDER BY messages.timestamp DESC")
-        query_parts.append("LIMIT ? OFFSET ?")
-        params.extend([limit, offset])
-
-        cursor.execute(" ".join(query_parts), tuple(params))
-        messages = cursor.fetchall()
-
-        result = []
-        for msg in messages:
-            message = row_to_message(msg)
-            message.chat_name = _resolved_chat_name(
-                message.chat_jid,
-                message.chat_name,
-                identity_context,
-            )
-            result.append(message)
-
-        attach_message_metadata(cursor, result)
-
-        if include_context and result:
-            # Add context for each message
-            messages_with_context = []
-            for msg in result:
-                context = get_message_context(msg.id, context_before, context_after)
-                messages_with_context.extend(context.before)
-                messages_with_context.append(context.message)
-                messages_with_context.extend(context.after)
-
-            return messages_with_context
-
-        # Format and display messages without context
-        return result
-
-    except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return []
-    finally:
-        if 'conn' in locals():
-            conn.close()
+    return result
 
 
 def get_message_context(
@@ -594,70 +385,15 @@ def get_message_context(
     after: int = 5
 ) -> MessageContext:
     """Get context around a specific message."""
-    try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
-        cursor = conn.cursor()
-        has_edited_at = _column_exists(cursor, "messages", "edited_at")
+    value = convex_client.query("context", {"id": message_id, "before": before, "after": after})
+    if not value:
+        raise ValueError(f"Message with ID {message_id} not found")
 
-        # Get the target message first
-        cursor.execute(f"""
-            SELECT {message_select_columns('messages', has_edited_at)}, messages.chat_jid
-            FROM messages
-            JOIN chats ON messages.chat_jid = chats.jid
-            LEFT JOIN messages AS reply_target ON reply_target.chat_jid = messages.chat_jid AND reply_target.id = messages.reply_to_message_id
-            WHERE messages.id = ?
-        """, (message_id,))
-        msg_data = cursor.fetchone()
-
-        if not msg_data:
-            raise ValueError(f"Message with ID {message_id} not found")
-
-        target_message = row_to_message(msg_data[:13])
-
-        # Get messages before
-        cursor.execute(f"""
-            SELECT {message_select_columns('messages', has_edited_at)}
-            FROM messages
-            JOIN chats ON messages.chat_jid = chats.jid
-            LEFT JOIN messages AS reply_target ON reply_target.chat_jid = messages.chat_jid AND reply_target.id = messages.reply_to_message_id
-            WHERE messages.chat_jid = ? AND messages.timestamp < ?
-            ORDER BY messages.timestamp DESC
-            LIMIT ?
-        """, (msg_data[13], msg_data[0], before))
-
-        before_messages = []
-        for msg in cursor.fetchall():
-            before_messages.append(row_to_message(msg))
-
-        # Get messages after
-        cursor.execute(f"""
-            SELECT {message_select_columns('messages', has_edited_at)}
-            FROM messages
-            JOIN chats ON messages.chat_jid = chats.jid
-            LEFT JOIN messages AS reply_target ON reply_target.chat_jid = messages.chat_jid AND reply_target.id = messages.reply_to_message_id
-            WHERE messages.chat_jid = ? AND messages.timestamp > ?
-            ORDER BY messages.timestamp ASC
-            LIMIT ?
-        """, (msg_data[13], msg_data[0], after))
-
-        after_messages = []
-        for msg in cursor.fetchall():
-            after_messages.append(row_to_message(msg))
-
-        attach_message_metadata(cursor, [*before_messages, target_message, *after_messages])
-
-        return MessageContext(
-            message=target_message,
-            before=before_messages,
-            after=after_messages
-        )
-
-    except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        raise
-    finally:
-        if 'conn' in locals():
-            conn.close()
+    return MessageContext(
+        message=row_to_message(value["message"]),
+        before=[row_to_message(row) for row in value.get("before") or []],
+        after=[row_to_message(row) for row in value.get("after") or []],
+    )
 
 
 def list_chats(
@@ -668,139 +404,49 @@ def list_chats(
     sort_by: str = "last_active"
 ) -> List[Chat]:
     """Get chats matching the specified criteria."""
-    try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
-        cursor = conn.cursor()
-        client_filter_query = query.strip() if query else None
+    client_filter_query = query.strip() if query else None
+    rows = convex_client.query("chats", {"includeLast": include_last_message}) or []
+    identity_context = _load_identity_context()
 
-        if include_last_message:
-            query_parts = ["""
-                SELECT
-                    chats.jid,
-                    chats.name,
-                    chats.last_message_time,
-                    messages.content as last_message,
-                    messages.sender as last_sender,
-                    messages.is_from_me as last_is_from_me
-                FROM chats
-            """]
-            query_parts.append("""
-                LEFT JOIN messages ON chats.jid = messages.chat_jid
-                AND chats.last_message_time = messages.timestamp
-            """)
-        else:
-            query_parts = ["""
-                SELECT
-                    chats.jid,
-                    chats.name,
-                    chats.last_message_time,
-                    NULL as last_message,
-                    NULL as last_sender,
-                    NULL as last_is_from_me
-                FROM chats
-            """]
+    result = []
+    for row in rows:
+        chat = row_to_chat(row)
+        raw_name = chat.name
+        chat.name = _resolved_chat_name(chat.jid, raw_name, identity_context)
+        result.append((raw_name, chat))
 
-        where_clauses = []
-        params = []
+    if client_filter_query:
+        result = [
+            (raw_name, chat)
+            for raw_name, chat in result
+            if _chat_matches_query(chat, client_filter_query, identity_context)
+        ]
 
-        if query and not client_filter_query:
-            where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
-            params.extend([f"%{query}%", f"%{query}%"])
+    if sort_by == "last_active":
+        result.sort(
+            key=lambda item: item[1].last_message_time.timestamp() if item[1].last_message_time else 0,
+            reverse=True,
+        )
+    elif client_filter_query:
+        result.sort(key=lambda item: (item[1].name or "").casefold())
+    else:
+        # Stored (unresolved) name, missing names first, as the chat store ordered it.
+        result.sort(key=lambda item: (item[0] is not None, item[0] or ""))
 
-        if where_clauses:
-            query_parts.append("WHERE " + " AND ".join(where_clauses))
-
-        # Add sorting
-        order_by = "chats.last_message_time DESC" if sort_by == "last_active" else "chats.name"
-        query_parts.append(f"ORDER BY {order_by}")
-
-        if not client_filter_query:
-            offset = page * limit
-            query_parts.append("LIMIT ? OFFSET ?")
-            params.extend([limit, offset])
-
-        cursor.execute(" ".join(query_parts), tuple(params))
-        chats = cursor.fetchall()
-        identity_context = _load_identity_context()
-
-        result = []
-        for chat_data in chats:
-            chat = Chat(
-                jid=chat_data[0],
-                name=_resolved_chat_name(chat_data[0], chat_data[1], identity_context),
-                last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
-                last_message=chat_data[3],
-                last_sender=chat_data[4],
-                last_is_from_me=chat_data[5]
-            )
-            result.append(chat)
-
-        if client_filter_query:
-            result = [
-                chat
-                for chat in result
-                if _chat_matches_query(chat, client_filter_query, identity_context)
-            ]
-            if sort_by == "last_active":
-                result.sort(
-                    key=lambda chat: chat.last_message_time.timestamp() if chat.last_message_time else 0,
-                    reverse=True,
-                )
-            else:
-                result.sort(key=lambda chat: (chat.name or "").casefold())
-            start = page * limit
-            result = result[start:start + limit]
-
-        return result
-
-    except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return []
-    finally:
-        if 'conn' in locals():
-            conn.close()
+    start = page * limit
+    return [chat for _, chat in result[start:start + limit]]
 
 
 def search_contacts(query: str) -> List[Contact]:
     """Search contacts by name or phone number."""
-    try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
-        cursor = conn.cursor()
-
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-
-        cursor.execute("""
-            SELECT DISTINCT
-                jid,
-                name
-            FROM chats
-            WHERE
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
-                AND jid NOT LIKE '%@g.us'
-            ORDER BY name, jid
-            LIMIT 50
-        """, (search_pattern, search_pattern))
-
-        contacts = cursor.fetchall()
-
-        result = []
-        for contact_data in contacts:
-            contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
-                name=contact_data[1],
-                jid=contact_data[0]
-            )
-            result.append(contact)
-
-        return result
-
-    except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return []
-    finally:
-        if 'conn' in locals():
-            conn.close()
+    return [
+        Contact(
+            phone_number=row["jid"].split('@')[0],
+            name=row.get("name"),
+            jid=row["jid"],
+        )
+        for row in convex_client.query("contacts", {"query": query}) or []
+    ]
 
 
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
@@ -811,197 +457,28 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
     """
-    try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            SELECT DISTINCT
-                c.jid,
-                c.name,
-                c.last_message_time,
-                m.content as last_message,
-                m.sender as last_sender,
-                m.is_from_me as last_is_from_me
-            FROM chats c
-            JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender = ? OR c.jid = ?
-            ORDER BY c.last_message_time DESC
-            LIMIT ? OFFSET ?
-        """, (jid, jid, limit, page * limit))
-
-        chats = cursor.fetchall()
-
-        result = []
-        for chat_data in chats:
-            chat = Chat(
-                jid=chat_data[0],
-                name=chat_data[1],
-                last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
-                last_message=chat_data[3],
-                last_sender=chat_data[4],
-                last_is_from_me=chat_data[5]
-            )
-            result.append(chat)
-
-        return result
-
-    except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return []
-    finally:
-        if 'conn' in locals():
-            conn.close()
+    rows = convex_client.query("contactChats", {"jid": jid, "limit": limit, "offset": page * limit})
+    return [row_to_chat(row) for row in rows or []]
 
 
 def get_last_interaction(jid: str) -> str:
     """Get most recent message involving the contact."""
-    try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            SELECT
-                m.timestamp,
-                m.sender,
-                c.name,
-                m.content,
-                m.is_from_me,
-                c.jid,
-                m.id,
-                m.media_type
-            FROM messages m
-            JOIN chats c ON m.chat_jid = c.jid
-            WHERE m.sender = ? OR c.jid = ?
-            ORDER BY m.timestamp DESC
-            LIMIT 1
-        """, (jid, jid))
-
-        msg_data = cursor.fetchone()
-
-        if not msg_data:
-            return None
-
-        message = Message(
-            timestamp=datetime.fromisoformat(msg_data[0]),
-            sender=msg_data[1],
-            chat_name=msg_data[2],
-            content=msg_data[3],
-            is_from_me=msg_data[4],
-            chat_jid=msg_data[5],
-            id=msg_data[6],
-            media_type=msg_data[7]
-        )
-
-        return format_message(message)
-
-    except sqlite3.Error as e:
-        print(f"Database error: {e}")
+    row = convex_client.query("lastInteraction", {"jid": jid})
+    if not row:
         return None
-    finally:
-        if 'conn' in locals():
-            conn.close()
+    return format_message(row_to_message(row))
 
 
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]:
     """Get chat metadata by JID."""
-    try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
-        cursor = conn.cursor()
-
-        if include_last_message:
-            query = """
-                SELECT
-                    c.jid,
-                    c.name,
-                    c.last_message_time,
-                    m.content as last_message,
-                    m.sender as last_sender,
-                    m.is_from_me as last_is_from_me
-                FROM chats c
-            """
-            query += """
-                LEFT JOIN messages m ON c.jid = m.chat_jid
-                AND c.last_message_time = m.timestamp
-            """
-        else:
-            query = """
-                SELECT
-                    c.jid,
-                    c.name,
-                    c.last_message_time,
-                    NULL as last_message,
-                    NULL as last_sender,
-                    NULL as last_is_from_me
-                FROM chats c
-            """
-
-        query += " WHERE c.jid = ?"
-
-        cursor.execute(query, (chat_jid,))
-        chat_data = cursor.fetchone()
-
-        if not chat_data:
-            return None
-
-        return Chat(
-            jid=chat_data[0],
-            name=chat_data[1],
-            last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
-            last_message=chat_data[3],
-            last_sender=chat_data[4],
-            last_is_from_me=chat_data[5]
-        )
-
-    except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return None
-    finally:
-        if 'conn' in locals():
-            conn.close()
+    row = convex_client.query("chat", {"jid": chat_jid, "includeLast": include_last_message})
+    return row_to_chat(row) if row else None
 
 
 def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
     """Get chat metadata by sender phone number."""
-    try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            SELECT
-                c.jid,
-                c.name,
-                c.last_message_time,
-                m.content as last_message,
-                m.sender as last_sender,
-                m.is_from_me as last_is_from_me
-            FROM chats c
-            LEFT JOIN messages m ON c.jid = m.chat_jid
-                AND c.last_message_time = m.timestamp
-            WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
-            LIMIT 1
-        """, (f"%{sender_phone_number}%",))
-
-        chat_data = cursor.fetchone()
-
-        if not chat_data:
-            return None
-
-        return Chat(
-            jid=chat_data[0],
-            name=chat_data[1],
-            last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
-            last_message=chat_data[3],
-            last_sender=chat_data[4],
-            last_is_from_me=chat_data[5]
-        )
-
-    except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return None
-    finally:
-        if 'conn' in locals():
-            conn.close()
+    row = convex_client.query("directChat", {"phone": sender_phone_number})
+    return row_to_chat(row) if row else None
 
 def send_message(recipient: str, message: str) -> Tuple[bool, str]:
     try:

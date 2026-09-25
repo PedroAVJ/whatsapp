@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -31,6 +32,9 @@ STOP_BRIDGE = SCRIPT_DIR / "stop_bridge.sh"
 STATUS_BRIDGE = SCRIPT_DIR / "status_bridge.sh"
 SETUP = SCRIPT_DIR / "setup.sh"
 RESET_SYNC = SCRIPT_DIR / "reset_sync.sh"
+# WhatsApp data is read from Near's Convex deployment through this client; the
+# backend script uses the same module.
+CONVEX_CLIENT_PATH = SOURCE_ROOT / "vendor" / "lharries-whatsapp-mcp" / "whatsapp-mcp-server" / "convex_client.py"
 DEFAULT_DRAFTS_DB_PATH = Path(
     os.environ.get("WHATSAPP_DRAFTS_DB_PATH", "~/.local/share/codex-whatsapp/drafts.db")
 ).expanduser()
@@ -132,12 +136,6 @@ def parse_json_output(process: subprocess.CompletedProcess[str], *, code: str = 
         )
     if not stdout:
         return {}
-    if "Database error:" in stdout:
-        raise CliError(
-            "WhatsApp backend reported a database error.",
-            code="backend_database_error",
-            details={"stdout": stdout[-4000:], "stderr": stderr[-4000:]},
-        )
     try:
         return json.loads(stdout)
     except json.JSONDecodeError as exc:
@@ -160,6 +158,44 @@ def parse_json_output(process: subprocess.CompletedProcess[str], *, code: str = 
 def backend_json(*args: str, timeout: int = 120) -> Any:
     ensure_source()
     return parse_json_output(run_process(["/bin/zsh", str(RUN_CLI), *args], timeout=timeout))
+
+
+_convex_client_module: Any = None
+
+
+def convex_client() -> Any:
+    global _convex_client_module
+    if _convex_client_module is None:
+        spec = importlib.util.spec_from_file_location("whatsapp_convex_client", CONVEX_CLIENT_PATH)
+        if spec is None or spec.loader is None or not CONVEX_CLIENT_PATH.exists():
+            raise CliError(
+                "WhatsApp Convex client is missing.",
+                code="missing_convex_client",
+                details={"path": str(CONVEX_CLIENT_PATH)},
+            )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _convex_client_module = module
+    return _convex_client_module
+
+
+def convex_query(name: str, args: dict[str, Any] | None = None) -> Any:
+    client = convex_client()
+    try:
+        return client.query(name, args)
+    except client.ConvexError as exc:
+        raise CliError(str(exc), code="convex_error", details={"function": f"whatsapp:{name}"}) from exc
+
+
+def backend_store_dir() -> Path | None:
+    """The bridge's local state directory, where drafts and transcripts live."""
+    try:
+        info = backend_json("store-info", timeout=30)
+    except CliError:
+        return None
+    if isinstance(info, dict) and info.get("store_dir"):
+        return Path(info["store_dir"]).expanduser()
+    return None
 
 
 def script_output(script: Path, *args: str, timeout: int = 120) -> dict[str, Any]:
@@ -227,7 +263,9 @@ def command_doctor(_args: argparse.Namespace) -> dict[str, Any]:
             "node": command_exists("node"),
         },
         "bridge": None,
-        "db_path": None,
+        "convex_url": None,
+        "convex_reachable": False,
+        "store_dir": None,
         "errors": [],
     }
     try:
@@ -235,8 +273,15 @@ def command_doctor(_args: argparse.Namespace) -> dict[str, Any]:
     except CliError as exc:
         report["errors"].append({"code": exc.code, "message": str(exc), "details": exc.details})
     try:
-        db = backend_json("db-path", timeout=30)
-        report["db_path"] = db.get("messages_db_path") if isinstance(db, dict) else db
+        info = backend_json("store-info", timeout=30)
+        if isinstance(info, dict):
+            report["convex_url"] = info.get("convex_url")
+            report["store_dir"] = info.get("store_dir")
+    except CliError as exc:
+        report["errors"].append({"code": exc.code, "message": str(exc), "details": exc.details})
+    try:
+        convex_query("chat", {"jid": "status@broadcast", "includeLast": False})
+        report["convex_reachable"] = True
     except CliError as exc:
         report["errors"].append({"code": exc.code, "message": str(exc), "details": exc.details})
     return report
@@ -528,52 +573,17 @@ def load_identity_context() -> dict[str, dict[str, str]]:
         "chat_names": {},
     }
 
-    try:
-        db_info = backend_json("db-path", timeout=30)
-    except CliError:
-        return context
+    identity = convex_query("identity") or {}
+    for chat in identity.get("chats") or []:
+        jid, name = chat.get("jid"), chat.get("name")
+        if isinstance(jid, str) and isinstance(name, str) and name:
+            context["chat_names"][jid] = name
 
-    if not isinstance(db_info, dict) or not db_info.get("messages_db_path"):
-        return context
-
-    messages_db_path = Path(db_info["messages_db_path"])
-    whatsapp_db_path = messages_db_path.with_name("whatsapp.db")
-
-    try:
-        with sqlite3.connect(messages_db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT jid, name FROM chats WHERE name IS NOT NULL AND name != ''")
-            for jid, name in cursor.fetchall():
-                if isinstance(jid, str) and isinstance(name, str) and name:
-                    context["chat_names"][jid] = name
-    except sqlite3.Error:
-        pass
-
-    if not whatsapp_db_path.exists():
-        return context
-
-    try:
-        with sqlite3.connect(whatsapp_db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT lid, pn FROM whatsmeow_lid_map")
-            for lid, phone in cursor.fetchall():
-                lid_user = jid_user(lid)
-                phone_user = jid_user(phone)
-                if lid_user and phone_user and phone_user.isdigit():
-                    context["lid_to_phone"][lid_user] = phone_user
-
-            cursor.execute(
-                """
-                SELECT their_jid, full_name, first_name, business_name, push_name
-                FROM whatsmeow_contacts
-                """
-            )
-            for their_jid, full_name, first_name, business_name, push_name in cursor.fetchall():
-                name = first_text(full_name, first_name, business_name, push_name)
-                if isinstance(their_jid, str) and name:
-                    context["contact_names"][their_jid] = name
-    except sqlite3.Error:
-        pass
+    for pair in identity.get("lids") or []:
+        lid_user = jid_user(pair.get("lid"))
+        phone_user = jid_user(pair.get("pn"))
+        if lid_user and phone_user and phone_user.isdigit():
+            context["lid_to_phone"][lid_user] = phone_user
 
     return context
 
@@ -835,13 +845,8 @@ def command_media_download(args: argparse.Namespace) -> dict[str, Any]:
 def transcripts_db_path() -> Path:
     if os.environ.get("WHATSAPP_TRANSCRIPTS_DB_PATH"):
         return DEFAULT_TRANSCRIPTS_DB_PATH
-    try:
-        db_info = backend_json("db-path", timeout=30)
-        if isinstance(db_info, dict) and db_info.get("messages_db_path"):
-            return Path(db_info["messages_db_path"]).with_name("transcripts.db")
-    except CliError:
-        pass
-    return DEFAULT_TRANSCRIPTS_DB_PATH
+    store_dir = backend_store_dir()
+    return store_dir / "transcripts.db" if store_dir else DEFAULT_TRANSCRIPTS_DB_PATH
 
 
 def transcript_store_dir() -> Path:
@@ -1239,21 +1244,54 @@ def command_media_transcribe(args: argparse.Namespace) -> dict[str, Any]:
         return _command_media_transcribe_locked(args)
 
 
-def resolve_messages_db_path() -> Path:
-    db_info = backend_json("db-path", timeout=30)
-    if not isinstance(db_info, dict) or not db_info.get("messages_db_path"):
-        raise CliError("Could not resolve the WhatsApp messages database path.", code="missing_messages_db")
-    path = Path(db_info["messages_db_path"]).expanduser()
-    if not path.exists():
-        raise CliError(
-            "The WhatsApp messages database does not exist yet.",
-            code="messages_db_missing",
-            details={"messages_db_path": str(path)},
-        )
-    return path
-
-
 MAX_TRANSCRIBE_ATTEMPTS = 3
+AUDIO_SCAN_PAGE_SIZE = 200
+
+
+def audio_messages(*, chat_jid: str | None, since: str | None) -> list[dict[str, Any]]:
+    """Audio messages in Convex, newest first, optionally scoped to a chat and a start time.
+
+    Walks the message history backwards a page at a time with a timestamp
+    cursor, so a long history never needs a large offset.
+    """
+    client = convex_client()
+    base: dict[str, Any] = {"limit": AUDIO_SCAN_PAGE_SIZE, "offset": 0}
+    if chat_jid:
+        base["chatJids"] = [chat_jid]
+    if since:
+        try:
+            # `since` is inclusive; Convex's `after` is exclusive.
+            base["after"] = client.to_ms(datetime.fromisoformat(since)) - 1
+        except ValueError as exc:
+            raise CliError("--since must be an ISO-8601 date or time.", code="invalid_since") from exc
+
+    audio: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    before: int | None = None
+    while True:
+        page = convex_query("messages", {**base, **({"before": before} if before is not None else {})}) or []
+        new = 0
+        for row in page:
+            key = (row["id"], row["chatJid"])
+            if key in seen:
+                continue
+            seen.add(key)
+            new += 1
+            if (row.get("mediaType") or "").lower() in AUDIO_MEDIA_TYPES:
+                audio.append(
+                    {
+                        "id": row["id"],
+                        "chat_jid": row["chatJid"],
+                        "sender": row["sender"],
+                        "timestamp": str(client.from_ms(row["timestamp"])),
+                        "media_type": row.get("mediaType"),
+                    }
+                )
+        if len(page) < AUDIO_SCAN_PAGE_SIZE:
+            return audio
+        oldest = int(min(row["timestamp"] for row in page))
+        # Re-read the boundary millisecond once so ties are not skipped, then move past it.
+        before = oldest + 1 if new else oldest
 
 
 def pending_audio_messages(
@@ -1264,7 +1302,7 @@ def pending_audio_messages(
     retry_failed: bool = False,
     exclude_keys: set[tuple[str, str]] | None = None,
 ) -> tuple[list[dict[str, Any]], int, int]:
-    """Audio messages in the bridge store that have no cached transcript yet.
+    """Audio messages in WhatsApp's Convex store that have no cached transcript yet.
 
     Pending means no transcript row exists for the message at all, whatever
     options produced it. Backfill never re-spends on an already transcribed
@@ -1286,26 +1324,7 @@ def pending_audio_messages(
             if row["last_code"] in PERMANENT_TRANSCRIBE_FAILURE_CODES:
                 permanent_failures.add((row["message_id"], row["chat_jid"]))
 
-    audio_types = sorted(AUDIO_MEDIA_TYPES)
-    clauses = ["LOWER(COALESCE(media_type, '')) IN ({})".format(",".join("?" for _ in audio_types))]
-    values: list[Any] = list(audio_types)
-    if chat_jid:
-        clauses.append("chat_jid = ?")
-        values.append(chat_jid)
-    if since:
-        clauses.append("timestamp >= ?")
-        values.append(since)
-
-    conn = sqlite3.connect(f"file:{resolve_messages_db_path()}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = conn.execute(
-            f"SELECT id, chat_jid, sender, timestamp, media_type FROM messages "
-            f"WHERE {' AND '.join(clauses)} ORDER BY timestamp DESC",
-            values,
-        ).fetchall()
-    finally:
-        conn.close()
+    rows = audio_messages(chat_jid=chat_jid, since=since)
 
     row_keys = {(row["id"], row["chat_jid"]) for row in rows}
     exhausted = (permanent_failures & row_keys) - transcribed
@@ -1671,13 +1690,8 @@ def resolve_reply_target(chat_jid: str, reply_to_message_id: str | None) -> dict
 
 
 def draft_db_path() -> Path:
-    try:
-        db_info = backend_json("db-path", timeout=30)
-        if isinstance(db_info, dict) and db_info.get("messages_db_path"):
-            return Path(db_info["messages_db_path"]).with_name("drafts.db")
-    except CliError:
-        pass
-    return DEFAULT_DRAFTS_DB_PATH
+    store_dir = backend_store_dir()
+    return store_dir / "drafts.db" if store_dir else DEFAULT_DRAFTS_DB_PATH
 
 
 def open_draft_db() -> sqlite3.Connection:
@@ -2008,7 +2022,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", help="Emit stable JSON envelope to stdout.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("doctor", help="Verify source root, tools, bridge status, and database path.").set_defaults(func=command_doctor)
+    subparsers.add_parser("doctor", help="Verify source root, tools, bridge status, and Convex reachability.").set_defaults(func=command_doctor)
 
     bridge_parser = subparsers.add_parser("bridge", help="Manage the local read-only WhatsApp bridge.")
     bridge_sub = bridge_parser.add_subparsers(dest="bridge_command", required=True)

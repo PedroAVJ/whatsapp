@@ -1,6 +1,5 @@
 import importlib.util
 import pathlib
-import sqlite3
 import stat
 import tempfile
 import unittest
@@ -168,28 +167,15 @@ class PendingTranscriptionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.temp.name)
-        self.messages = self.root / "messages.db"
         self.transcripts = self.root / "transcripts.db"
-        connection = sqlite3.connect(self.messages)
-        connection.execute(
-            """
-            CREATE TABLE messages (
-                id TEXT,
-                chat_jid TEXT,
-                sender TEXT,
-                timestamp TEXT,
-                media_type TEXT
-            )
-            """
-        )
-        connection.execute(
-            "INSERT INTO messages VALUES ('message-1', 'chat-1', 'sender-1', '2026-08-11T10:00:00Z', 'audio')"
-        )
-        connection.commit()
-        connection.close()
+        # WhatsApp messages come from Convex; answer its `messages` query from memory.
+        self.rows = [
+            {"id": "message-1", "chatJid": "chat-1", "sender": "sender-1", "timestamp": 1786442400000.0, "mediaType": "audio"},
+            {"id": "message-2", "chatJid": "chat-1", "sender": "sender-1", "timestamp": 1786442300000.0, "mediaType": "image"},
+        ]
         self.patches = [
             mock.patch.object(MODULE, "transcripts_db_path", return_value=self.transcripts),
-            mock.patch.object(MODULE, "resolve_messages_db_path", return_value=self.messages),
+            mock.patch.object(MODULE, "convex_query", side_effect=self.fake_messages_query),
         ]
         for patcher in self.patches:
             patcher.start()
@@ -198,6 +184,47 @@ class PendingTranscriptionTests(unittest.TestCase):
         for patcher in reversed(self.patches):
             patcher.stop()
         self.temp.cleanup()
+
+    def fake_messages_query(self, name, args=None):
+        self.assertEqual("messages", name)
+        rows = [
+            row
+            for row in self.rows
+            if ("after" not in args or row["timestamp"] > args["after"])
+            and ("before" not in args or row["timestamp"] < args["before"])
+            and ("chatJids" not in args or row["chatJid"] in args["chatJids"])
+        ]
+        rows.sort(key=lambda row: row["timestamp"], reverse=True)
+        return rows[args["offset"] : args["offset"] + args["limit"]]
+
+    def test_only_audio_messages_are_pending_and_since_is_inclusive(self):
+        pending, total, _ = MODULE.pending_audio_messages(
+            chat_jid="chat-1", since="2026-08-11T10:00:00+00:00", limit=10
+        )
+        later, later_total, _ = MODULE.pending_audio_messages(
+            chat_jid=None, since="2026-08-11T10:00:01+00:00", limit=10
+        )
+
+        self.assertEqual(["message-1"], [item["message_id"] for item in pending])
+        self.assertEqual(1, total)
+        self.assertEqual("audio", pending[0]["media_type"])
+        self.assertEqual(
+            MODULE.datetime.fromisoformat("2026-08-11T10:00:00+00:00"),
+            MODULE.datetime.fromisoformat(pending[0]["timestamp"]),
+        )
+        self.assertEqual([], later)
+        self.assertEqual(0, later_total)
+
+    def test_audio_scan_pages_by_time_without_skipping_or_repeating(self):
+        self.rows = [
+            {"id": f"m-{index}", "chatJid": "chat-1", "sender": "s", "timestamp": 1786442400000.0 - (index // 2) * 1000, "mediaType": "ptt"}
+            for index in range(7)
+        ]
+        with mock.patch.object(MODULE, "AUDIO_SCAN_PAGE_SIZE", 3):
+            messages = MODULE.audio_messages(chat_jid=None, since=None)
+
+        self.assertEqual([f"m-{index}" for index in range(7)], sorted(item["id"] for item in messages))
+        self.assertEqual(7, len(messages))
 
     def test_transient_failures_remain_automatically_eligible_after_many_attempts(self):
         for _ in range(5):
