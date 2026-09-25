@@ -251,6 +251,7 @@ test("upstream backend is patched for local state env vars", () => {
   assert.match(whatsappPy, /WHATSAPP_MCP_API_BASE_URL/);
   assert.match(bridgeGo, /WHATSAPP_MCP_STORE_DIR/);
   assert.match(bridgeGo, /WHATSAPP_MCP_HTTP_PORT/);
+  assert.match(bridgeGo, /serverAddr := fmt\.Sprintf\("127\.0\.0\.1:%d", port\)/, "the unauthenticated REST API listens on localhost only");
   assert.match(bridgeGo, /api\/health/);
 });
 
@@ -421,7 +422,7 @@ test("whatsapp plugin versions stay synchronized", () => {
   );
   const pkg = JSON.parse(fs.readFileSync(path.join(pluginRoot, "package.json"), "utf8"));
 
-  assert.equal(codexManifest.version, "0.11.12");
+  assert.equal(codexManifest.version, "0.11.13");
   assert.equal(claudeManifest.version, codexManifest.version);
   assert.equal(pkg.version, codexManifest.version);
 });
