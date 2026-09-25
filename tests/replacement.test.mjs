@@ -421,7 +421,7 @@ test("whatsapp plugin versions stay synchronized", () => {
   );
   const pkg = JSON.parse(fs.readFileSync(path.join(pluginRoot, "package.json"), "utf8"));
 
-  assert.equal(codexManifest.version, "0.11.13");
+  assert.equal(codexManifest.version, "0.11.14");
   assert.equal(claudeManifest.version, codexManifest.version);
   assert.equal(pkg.version, codexManifest.version);
 });
