@@ -297,10 +297,10 @@ test("reply metadata is persisted and exposed by the vendored backend", () => {
     "utf8",
   );
 
-  assert.match(bridgeGo, /reply_to_message_id TEXT/);
-  assert.match(bridgeGo, /reply_to_sender TEXT/);
-  assert.match(bridgeGo, /reply_to_content TEXT/);
-  assert.match(bridgeGo, /reply_to_media_type TEXT/);
+  assert.match(bridgeGo, /putString\(message, "replyToMessageId", reply\.MessageID\)/);
+  assert.match(bridgeGo, /putString\(message, "replyToSender", reply\.Sender\)/);
+  assert.match(bridgeGo, /putString\(message, "replyToContent", reply\.Content\)/);
+  assert.match(bridgeGo, /putString\(message, "replyToMediaType", reply\.MediaType\)/);
   assert.match(bridgeGo, /extractReplyMetadata/);
 
   assert.match(whatsappPy, /reply_to_message_id: Optional\[str\] = None/);
