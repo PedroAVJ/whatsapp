@@ -7,7 +7,7 @@ import test from "node:test";
 const root = fileURLToPath(new URL("..", import.meta.url));
 const expected = {
   "name": "whatsapp",
-  "version": "0.11.13",
+  "version": "0.11.14",
   "url": "https://github.com/PedroAVJ/whatsapp",
   "dependencies": [
     "contacts@package-manager",

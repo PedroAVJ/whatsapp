@@ -4,9 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -171,13 +176,8 @@ func TestExtractReactionMetadataReadsPlainReaction(t *testing.T) {
 }
 
 func TestStoreReactionUpsertsAndRemovesCurrentReaction(t *testing.T) {
-	t.Setenv("WHATSAPP_MCP_STORE_DIR", t.TempDir())
-
-	store, err := NewMessageStore()
-	if err != nil {
-		t.Fatalf("NewMessageStore() error = %v", err)
-	}
-	defer store.Close()
+	convex := newFakeConvex(t)
+	store := newTestStore(t)
 
 	reaction := ReactionMetadata{
 		ReactionMessageID: "REACTION-ID",
@@ -197,35 +197,26 @@ func TestStoreReactionUpsertsAndRemovesCurrentReaction(t *testing.T) {
 		t.Fatalf("StoreReaction() update error = %v", err)
 	}
 
-	var emoji string
-	var count int
-	if err := store.db.QueryRow("SELECT emoji, COUNT(*) FROM message_reactions WHERE chat_jid = ? AND target_message_id = ?", "chat@g.us", "TARGET-ID").Scan(&emoji, &count); err != nil {
-		t.Fatalf("SELECT reaction error = %v", err)
+	rows := convex.reactionsFor("chat@g.us", "TARGET-ID")
+	if len(rows) != 1 || rows[0]["emoji"] != "ok" {
+		t.Fatalf("reactions = %v, want one ok reaction", rows)
 	}
-	if emoji != "ok" || count != 1 {
-		t.Fatalf("reaction row = (%q, %d), want (ok, 1)", emoji, count)
+	if rows[0]["timestamp"] != float64(1_700_000_000_000) {
+		t.Fatalf("reaction timestamp = %v, want epoch milliseconds", rows[0]["timestamp"])
 	}
 
 	reaction.Emoji = ""
 	if err := store.StoreReaction(reaction); err != nil {
 		t.Fatalf("StoreReaction() remove error = %v", err)
 	}
-	if err := store.db.QueryRow("SELECT COUNT(*) FROM message_reactions").Scan(&count); err != nil {
-		t.Fatalf("COUNT reactions error = %v", err)
-	}
-	if count != 0 {
-		t.Fatalf("reaction count = %d, want 0", count)
+	if rows := convex.reactionsFor("chat@g.us", "TARGET-ID"); len(rows) != 0 {
+		t.Fatalf("reaction count = %d, want 0", len(rows))
 	}
 }
 
 func TestStoreReceiptPersistsReadReceipt(t *testing.T) {
-	t.Setenv("WHATSAPP_MCP_STORE_DIR", t.TempDir())
-
-	store, err := NewMessageStore()
-	if err != nil {
-		t.Fatalf("NewMessageStore() error = %v", err)
-	}
-	defer store.Close()
+	convex := newFakeConvex(t)
+	store := newTestStore(t)
 
 	timestamp := time.Unix(1_700_000_000, 0)
 	if err := store.StoreReceipt(
@@ -239,12 +230,12 @@ func TestStoreReceiptPersistsReadReceipt(t *testing.T) {
 		t.Fatalf("StoreReceipt() error = %v", err)
 	}
 
-	var receiptType, receiptSender, messageSender string
-	if err := store.db.QueryRow("SELECT receipt_type, receipt_sender, message_sender FROM message_receipts WHERE message_id = ?", "MSG-ID").Scan(&receiptType, &receiptSender, &messageSender); err != nil {
-		t.Fatalf("SELECT receipt error = %v", err)
+	receipt := convex.receipt("MSG-ID")
+	if receipt == nil {
+		t.Fatalf("receipt was not stored")
 	}
-	if receiptType != "read" || receiptSender != "15550987654@s.whatsapp.net" || messageSender != "me" {
-		t.Fatalf("receipt row = (%q, %q, %q)", receiptType, receiptSender, messageSender)
+	if receipt["receiptType"] != "read" || receipt["receiptSender"] != "15550987654@s.whatsapp.net" || receipt["messageSender"] != "me" {
+		t.Fatalf("receipt = %v", receipt)
 	}
 }
 
@@ -397,13 +388,8 @@ func TestExtractTextContentReadsBusinessMessages(t *testing.T) {
 }
 
 func TestStoreEventMessagePersistsTemplateText(t *testing.T) {
-	t.Setenv("WHATSAPP_MCP_STORE_DIR", t.TempDir())
-
-	store, err := NewMessageStore()
-	if err != nil {
-		t.Fatalf("NewMessageStore() error = %v", err)
-	}
-	defer store.Close()
+	convex := newFakeConvex(t)
+	store := newTestStore(t)
 
 	evt := &events.Message{
 		Info: types.MessageInfo{
@@ -430,12 +416,9 @@ func TestStoreEventMessagePersistsTemplateText(t *testing.T) {
 		t.Fatalf("storeEventMessage() error = %v", err)
 	}
 
-	var content string
-	if err := store.db.QueryRow("SELECT content FROM messages WHERE id = ?", "BUSINESS-TEMPLATE-ID").Scan(&content); err != nil {
-		t.Fatalf("SELECT stored template error = %v", err)
-	}
-	if content != "Your appointment is confirmed." {
-		t.Fatalf("stored content = %q", content)
+	row := convex.message(evt.Info.Chat.String(), "BUSINESS-TEMPLATE-ID")
+	if row == nil || row["content"] != "Your appointment is confirmed." {
+		t.Fatalf("stored message = %v", row)
 	}
 }
 
@@ -496,12 +479,8 @@ func TestRefreshFallbackDirectChatNamesUsesWhatsmeowContactCache(t *testing.T) {
 		t.Fatalf("PutBusinessName() error = %v", err)
 	}
 
-	t.Setenv("WHATSAPP_MCP_STORE_DIR", t.TempDir())
-	messageStore, err := NewMessageStore()
-	if err != nil {
-		t.Fatalf("NewMessageStore() error = %v", err)
-	}
-	defer messageStore.Close()
+	convex := newFakeConvex(t)
+	messageStore := newTestStore(t)
 
 	timestamp := time.Unix(1_700_000_000, 0)
 	if err := messageStore.StoreChat(chatJID.String(), chatJID.User, timestamp); err != nil {
@@ -511,12 +490,12 @@ func TestRefreshFallbackDirectChatNamesUsesWhatsmeowContactCache(t *testing.T) {
 	client := whatsmeow.NewClient(device, waLog.Noop)
 	refreshFallbackDirectChatNames(client, messageStore, waLog.Noop)
 
-	var name string
-	if err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID.String()).Scan(&name); err != nil {
-		t.Fatalf("SELECT refreshed chat error = %v", err)
+	chat := convex.chat(chatJID.String())
+	if chat == nil || chat["name"] != "Example Business" {
+		t.Fatalf("refreshed chat = %v, want business name", chat)
 	}
-	if name != "Example Business" {
-		t.Fatalf("refreshed chat name = %q, want business name", name)
+	if chat["lastMessageTime"] != float64(timestamp.UnixMilli()) {
+		t.Fatalf("refreshed chat lastMessageTime = %v, want %d", chat["lastMessageTime"], timestamp.UnixMilli())
 	}
 }
 
@@ -734,13 +713,8 @@ func TestNormalizeMessageForStorageLeavesRegularMessagesUntouched(t *testing.T) 
 }
 
 func TestStoreSentMessagePersistsOutboundText(t *testing.T) {
-	t.Setenv("WHATSAPP_MCP_STORE_DIR", t.TempDir())
-
-	store, err := NewMessageStore()
-	if err != nil {
-		t.Fatalf("NewMessageStore() error = %v", err)
-	}
-	defer store.Close()
+	convex := newFakeConvex(t)
+	store := newTestStore(t)
 
 	chat := types.JID{User: "99900123456789", Server: "lid"}
 	timestamp := time.Unix(1_700_000_000, 0)
@@ -750,24 +724,16 @@ func TestStoreSentMessagePersistsOutboundText(t *testing.T) {
 		t.Fatalf("storeSentMessage() error = %v", err)
 	}
 
-	var content, sender string
-	var isFromMe bool
-	if err := store.db.QueryRow(
-		"SELECT content, sender, is_from_me FROM messages WHERE id = ? AND chat_jid = ?",
-		"SENT-ID", chat.String(),
-	).Scan(&content, &sender, &isFromMe); err != nil {
-		t.Fatalf("SELECT sent message error = %v", err)
+	row := convex.message(chat.String(), "SENT-ID")
+	if row == nil {
+		t.Fatalf("sent message was not stored")
 	}
-	if content != "outbound text" || sender != "15551230001@s.whatsapp.net" || !isFromMe {
-		t.Fatalf("sent message row = (%q, %q, %v), want (outbound text, 15551230001@s.whatsapp.net, true)", content, sender, isFromMe)
+	if row["content"] != "outbound text" || row["sender"] != "15551230001@s.whatsapp.net" || row["isFromMe"] != true {
+		t.Fatalf("sent message = %v, want (outbound text, 15551230001@s.whatsapp.net, true)", row)
 	}
 
-	var chatCount int
-	if err := store.db.QueryRow("SELECT COUNT(*) FROM chats WHERE jid = ?", chat.String()).Scan(&chatCount); err != nil {
-		t.Fatalf("SELECT chat error = %v", err)
-	}
-	if chatCount != 1 {
-		t.Fatalf("chat rows = %d, want 1 (own sends must also upsert the chat)", chatCount)
+	if convex.chat(chat.String()) == nil {
+		t.Fatalf("chat missing (own sends must also upsert the chat)")
 	}
 }
 
@@ -915,13 +881,8 @@ func TestNormalizeMessageForStorageTrustsWhatsmeowEditFlagWithoutType(t *testing
 }
 
 func TestApplyMessageEditRevisesTextAndKeepsReplyMetadata(t *testing.T) {
-	t.Setenv("WHATSAPP_MCP_STORE_DIR", t.TempDir())
-
-	store, err := NewMessageStore()
-	if err != nil {
-		t.Fatalf("NewMessageStore() error = %v", err)
-	}
-	defer store.Close()
+	convex := newFakeConvex(t)
+	store := newTestStore(t)
 
 	original := time.Unix(1_700_000_000, 0)
 	if err := store.StoreChat("chat@s.whatsapp.net", "Chat", original); err != nil {
@@ -948,37 +909,29 @@ func TestApplyMessageEditRevisesTextAndKeepsReplyMetadata(t *testing.T) {
 		t.Fatalf("ApplyMessageEdit() updated = false, want true")
 	}
 
-	var content, replyTo, replyContent string
-	var storedTimestamp, editedStamp time.Time
-	if err := store.db.QueryRow(
-		"SELECT content, reply_to_message_id, reply_to_content, timestamp, edited_at FROM messages WHERE id = ? AND chat_jid = ?",
-		"ORIGINAL-ID", "chat@s.whatsapp.net",
-	).Scan(&content, &replyTo, &replyContent, &storedTimestamp, &editedStamp); err != nil {
-		t.Fatalf("SELECT message error = %v", err)
+	row := convex.message("chat@s.whatsapp.net", "ORIGINAL-ID")
+	if row["content"] != "Miércoles 26 a la 7:50 pm" {
+		t.Fatalf("content = %v, want the edited text", row["content"])
+	}
+	if row["replyToMessageId"] != "QUOTED-ID" || row["replyToContent"] != "quoted text" {
+		t.Fatalf("edit wiped reply metadata: %v", row)
+	}
+	if row["timestamp"] != float64(original.UnixMilli()) {
+		t.Fatalf("timestamp = %v, want the original send time %d", row["timestamp"], original.UnixMilli())
+	}
+	if row["editedAt"] != float64(editedAt.UnixMilli()) {
+		t.Fatalf("editedAt = %v, want %d", row["editedAt"], editedAt.UnixMilli())
 	}
 
-	if content != "Miércoles 26 a la 7:50 pm" {
-		t.Fatalf("content = %q, want the edited text", content)
-	}
-	if replyTo != "QUOTED-ID" || replyContent != "quoted text" {
-		t.Fatalf("edit wiped reply metadata: reply_to = %q, reply_content = %q", replyTo, replyContent)
-	}
-	if !storedTimestamp.Equal(original) {
-		t.Fatalf("timestamp = %v, want the original send time %v", storedTimestamp, original)
-	}
-	if !editedStamp.Equal(editedAt) {
-		t.Fatalf("edited_at = %v, want %v", editedStamp, editedAt)
+	stored, found, err := store.GetStoredMessageTimestamp("ORIGINAL-ID", "chat@s.whatsapp.net")
+	if err != nil || !found || !stored.Equal(original) {
+		t.Fatalf("GetStoredMessageTimestamp() = (%v, %v, %v), want the original send time", stored, found, err)
 	}
 }
 
 func TestApplyMessageEditReportsMissWhenOriginalUnknown(t *testing.T) {
-	t.Setenv("WHATSAPP_MCP_STORE_DIR", t.TempDir())
-
-	store, err := NewMessageStore()
-	if err != nil {
-		t.Fatalf("NewMessageStore() error = %v", err)
-	}
-	defer store.Close()
+	newFakeConvex(t)
+	store := newTestStore(t)
 
 	updated, err := store.ApplyMessageEdit(
 		"MISSING-ID", "chat@s.whatsapp.net", "revised", time.Unix(1_700_000_000, 0),
@@ -1010,43 +963,292 @@ func TestDescribeMessagePayloadNamesFieldsWithoutContent(t *testing.T) {
 	}
 }
 
-func TestEnsureMessageSchemaAddsEditedAtToExistingDatabase(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "messages.db")
+func TestNewMessageStoreFailsWithoutToken(t *testing.T) {
+	t.Setenv("WHATSAPP_CONVEX_WRITE_TOKEN", "")
+	t.Setenv("PATH", t.TempDir()) // no `security` binary, so no Keychain fallback
 
-	db, err := sql.Open("sqlite3", dbPath+"?_foreign_keys=on")
+	if _, err := NewMessageStore(); err == nil || !strings.Contains(err.Error(), "WHATSAPP_CONVEX_WRITE_TOKEN") {
+		t.Fatalf("NewMessageStore() error = %v, want a missing-token error", err)
+	}
+}
+
+func TestConvexErrorIsReturnedWithoutToken(t *testing.T) {
+	convex := newFakeConvex(t)
+	convex.failWith = "Value does not match validator: {token: \"test-token\"}"
+	store := newTestStore(t)
+
+	err := store.StoreChat("chat@s.whatsapp.net", "Chat", time.Unix(1_700_000_000, 0))
+	if err == nil {
+		t.Fatalf("StoreChat() error = nil, want the Convex error")
+	}
+	if strings.Contains(err.Error(), "test-token") || !strings.Contains(err.Error(), "whatsapp:upsertChat") {
+		t.Fatalf("StoreChat() error = %q, want the function named and the token redacted", err)
+	}
+}
+
+func TestMediaInfoRoundTripsBinaryFieldsAndReportsMissing(t *testing.T) {
+	newFakeConvex(t)
+	store := newTestStore(t)
+
+	timestamp := time.Unix(1_700_000_000, 0)
+	if err := store.StoreMessage("MEDIA-ID", "chat@s.whatsapp.net", "15551230001@s.whatsapp.net", "", timestamp, false,
+		"image", ReplyMetadata{}, "image.jpg", "", nil, nil, nil, 0); err != nil {
+		t.Fatalf("StoreMessage() error = %v", err)
+	}
+	if err := store.StoreMediaInfo("MEDIA-ID", "chat@s.whatsapp.net", "https://mmg.whatsapp.net/x?e=1", []byte{1, 2}, []byte{3}, []byte{4, 5, 6}, 42); err != nil {
+		t.Fatalf("StoreMediaInfo() error = %v", err)
+	}
+
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err := store.GetMediaInfo("MEDIA-ID", "chat@s.whatsapp.net")
+	if err != nil {
+		t.Fatalf("GetMediaInfo() error = %v", err)
+	}
+	if mediaType != "image" || filename != "image.jpg" || url != "https://mmg.whatsapp.net/x?e=1" || fileLength != 42 ||
+		string(mediaKey) != string([]byte{1, 2}) || string(fileSHA256) != string([]byte{3}) || string(fileEncSHA256) != string([]byte{4, 5, 6}) {
+		t.Fatalf("GetMediaInfo() = (%q, %q, %q, %v, %v, %v, %d)", mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength)
+	}
+
+	if _, _, _, _, _, _, _, err := store.GetMediaInfo("MISSING-ID", "chat@s.whatsapp.net"); err != sql.ErrNoRows {
+		t.Fatalf("GetMediaInfo() missing error = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestSyncIdentitySendsSelfAndLIDMapInBatches(t *testing.T) {
+	convex := newFakeConvex(t)
+	storeDir := t.TempDir()
+	t.Setenv("WHATSAPP_MCP_STORE_DIR", storeDir)
+
+	db, err := sql.Open("sqlite3", filepath.Join(storeDir, "whatsapp.db"))
 	if err != nil {
 		t.Fatalf("sql.Open() error = %v", err)
 	}
 	defer db.Close()
-
-	// A store predating edited_at, holding a message already on record.
-	if _, err := db.Exec(`
-		CREATE TABLE chats (jid TEXT PRIMARY KEY, name TEXT, last_message_time TIMESTAMP);
-		CREATE TABLE messages (
-			id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIMESTAMP,
-			is_from_me BOOLEAN, media_type TEXT, filename TEXT, url TEXT,
-			media_key BLOB, file_sha256 BLOB, file_enc_sha256 BLOB, file_length INTEGER,
-			PRIMARY KEY (id, chat_jid)
-		);
-		INSERT INTO messages (id, chat_jid, content) VALUES ('OLD-ID', 'chat@s.whatsapp.net', 'already stored');
-	`); err != nil {
-		t.Fatalf("seed legacy schema error = %v", err)
+	if _, err := db.Exec("CREATE TABLE whatsmeow_lid_map (lid TEXT PRIMARY KEY, pn TEXT UNIQUE NOT NULL)"); err != nil {
+		t.Fatalf("CREATE TABLE error = %v", err)
+	}
+	for i := 0; i < 1201; i++ {
+		if _, err := db.Exec("INSERT INTO whatsmeow_lid_map (lid, pn) VALUES (?, ?)", fmt.Sprintf("999%08d", i), fmt.Sprintf("1555%07d", i)); err != nil {
+			t.Fatalf("INSERT error = %v", err)
+		}
 	}
 
-	if err := ensureMessageSchema(db); err != nil {
-		t.Fatalf("ensureMessageSchema() error = %v", err)
+	store := newTestStore(t)
+	device := &waStore.Device{}
+	ownJID := types.JID{User: "15550000000", Device: 12, Server: types.DefaultUserServer}
+	device.ID = &ownJID
+	client := &whatsmeow.Client{Store: device}
+
+	syncIdentity(client, store, waLog.Noop)
+	calls := convex.identityCalls()
+	if len(calls) != 3 {
+		t.Fatalf("setIdentity calls = %d, want 3 batches", len(calls))
+	}
+	if calls[0]["self"] != "15550000000@s.whatsapp.net" {
+		t.Fatalf("self = %v, want the device JID without device suffix", calls[0]["self"])
+	}
+	total := 0
+	for _, call := range calls {
+		total += len(call["lids"].([]any))
+	}
+	if total != 1201 {
+		t.Fatalf("LID pairs sent = %d, want 1201", total)
 	}
 
-	var content string
-	var editedAt sql.NullTime
-	if err := db.QueryRow("SELECT content, edited_at FROM messages WHERE id = 'OLD-ID'").Scan(&content, &editedAt); err != nil {
-		t.Fatalf("SELECT after migration error = %v", err)
+	syncIdentity(client, store, waLog.Noop)
+	if len(convex.identityCalls()) != 3 {
+		t.Fatalf("unchanged identity was sent again")
 	}
-	if content != "already stored" {
-		t.Fatalf("migration disturbed stored content: %q", content)
+}
+
+// fakeConvex stands in for Near's Convex deployment: it serves the whatsapp:*
+// functions the bridge calls, over the same HTTP protocol, from memory.
+type fakeConvex struct {
+	mu        sync.Mutex
+	failWith  string
+	chats     map[string]map[string]any
+	messages  map[string]map[string]any
+	reactions map[string]map[string]any
+	receipts  map[string]map[string]any
+	identity  []map[string]any
+}
+
+func newFakeConvex(t *testing.T) *fakeConvex {
+	t.Helper()
+	convex := &fakeConvex{
+		chats:     map[string]map[string]any{},
+		messages:  map[string]map[string]any{},
+		reactions: map[string]map[string]any{},
+		receipts:  map[string]map[string]any{},
 	}
-	if editedAt.Valid {
-		t.Fatalf("edited_at = %v for a message that was never edited, want NULL", editedAt.Time)
+	server := httptest.NewServer(http.HandlerFunc(convex.serve))
+	t.Cleanup(server.Close)
+	t.Setenv("WHATSAPP_CONVEX_URL", server.URL)
+	t.Setenv("WHATSAPP_CONVEX_WRITE_TOKEN", "test-token")
+	return convex
+}
+
+func newTestStore(t *testing.T) *MessageStore {
+	t.Helper()
+	store, err := NewMessageStore()
+	if err != nil {
+		t.Fatalf("NewMessageStore() error = %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
+	return store
+}
+
+func (f *fakeConvex) serve(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Path   string         `json:"path"`
+		Args   map[string]any `json:"args"`
+		Format string         `json:"format"`
+	}
+	reply := func(status int, body map[string]any) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(body)
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Format != "json" {
+		reply(http.StatusBadRequest, map[string]any{"status": "error", "errorMessage": "bad request"})
+		return
+	}
+	if request.Args["token"] != "test-token" {
+		reply(http.StatusOK, map[string]any{"status": "error", "errorMessage": "Unauthorized"})
+		return
+	}
+	delete(request.Args, "token")
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failWith != "" {
+		reply(http.StatusBadRequest, map[string]any{"status": "error", "errorMessage": f.failWith})
+		return
+	}
+
+	kind := "/api/mutation"
+	switch request.Path {
+	case "whatsapp:storedTimestamp", "whatsapp:recentMessages", "whatsapp:chatTimes", "whatsapp:chatName", "whatsapp:mediaInfo":
+		kind = "/api/query"
+	}
+	if r.URL.Path != kind {
+		reply(http.StatusBadRequest, map[string]any{"status": "error", "errorMessage": request.Path + " called on " + r.URL.Path})
+		return
+	}
+
+	args := request.Args
+	str := func(key string) string { value, _ := args[key].(string); return value }
+	var value any
+	switch request.Path {
+	case "whatsapp:upsertChat":
+		f.chats[str("jid")] = args
+	case "whatsapp:storeMessages":
+		for _, raw := range args["messages"].([]any) {
+			m := raw.(map[string]any)
+			if m["content"] == "" && m["mediaType"] == nil {
+				continue
+			}
+			f.messages[m["chatJid"].(string)+"|"+m["id"].(string)] = m
+		}
+	case "whatsapp:applyEdit":
+		m := f.messages[str("chatJid")+"|"+str("id")]
+		if m == nil {
+			value = false
+			break
+		}
+		m["content"], m["editedAt"] = args["content"], args["editedAt"]
+		if args["mediaType"] != nil {
+			for _, key := range []string{"mediaType", "filename", "url", "mediaKey", "fileSha256", "fileEncSha256", "fileLength"} {
+				m[key] = args[key]
+			}
+		}
+		value = true
+	case "whatsapp:storeReaction":
+		reaction := args["reaction"].(map[string]any)
+		key := reaction["chatJid"].(string) + "|" + reaction["targetMessageId"].(string) + "|" + reaction["reactionSender"].(string)
+		if reaction["emoji"] == "" {
+			delete(f.reactions, key)
+		} else {
+			f.reactions[key] = reaction
+		}
+	case "whatsapp:storeReceipt":
+		receipt := args["receipt"].(map[string]any)
+		f.receipts[receipt["messageId"].(string)] = receipt
+	case "whatsapp:storeMediaInfo":
+		if m := f.messages[str("chatJid")+"|"+str("id")]; m != nil {
+			for _, key := range []string{"url", "mediaKey", "fileSha256", "fileEncSha256", "fileLength"} {
+				m[key] = args[key]
+			}
+		}
+	case "whatsapp:setIdentity":
+		f.identity = append(f.identity, args)
+	case "whatsapp:storedTimestamp":
+		if m := f.messages[str("chatJid")+"|"+str("id")]; m != nil {
+			value = m["timestamp"]
+		}
+	case "whatsapp:chatTimes":
+		rows := []map[string]any{}
+		for jid, chat := range f.chats {
+			last, _ := chat["lastMessageTime"].(float64)
+			rows = append(rows, map[string]any{"jid": jid, "lastMessageTime": last})
+		}
+		value = rows
+	case "whatsapp:chatName":
+		if chat := f.chats[str("jid")]; chat != nil {
+			value = chat["name"]
+		}
+	case "whatsapp:mediaInfo":
+		if m := f.messages[str("chatJid")+"|"+str("id")]; m != nil {
+			info := map[string]any{"fileLength": 0.0}
+			for _, key := range []string{"mediaType", "filename", "url", "mediaKey", "fileSha256", "fileEncSha256"} {
+				info[key] = ""
+				if m[key] != nil {
+					info[key] = m[key]
+				}
+			}
+			if m["fileLength"] != nil {
+				info["fileLength"] = m["fileLength"]
+			}
+			value = info
+		}
+	default:
+		reply(http.StatusNotFound, map[string]any{"status": "error", "errorMessage": "unknown function " + request.Path})
+		return
+	}
+	reply(http.StatusOK, map[string]any{"status": "success", "value": value})
+}
+
+func (f *fakeConvex) message(chatJID, id string) map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.messages[chatJID+"|"+id]
+}
+
+func (f *fakeConvex) chat(jid string) map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.chats[jid]
+}
+
+func (f *fakeConvex) receipt(messageID string) map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.receipts[messageID]
+}
+
+func (f *fakeConvex) reactionsFor(chatJID, targetID string) []map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var rows []map[string]any
+	for _, reaction := range f.reactions {
+		if reaction["chatJid"] == chatJID && reaction["targetMessageId"] == targetID {
+			rows = append(rows, reaction)
+		}
+	}
+	return rows
+}
+
+func (f *fakeConvex) identityCalls() []map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]map[string]any{}, f.identity...)
 }

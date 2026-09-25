@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -21,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -73,9 +76,16 @@ type ReactionMetadata struct {
 	IsFromMe          bool
 }
 
-// Database handler for storing message history
+// MessageStore keeps WhatsApp data in Near's Convex deployment over its HTTP API.
 type MessageStore struct {
-	db *sql.DB
+	baseURL string
+	token   string
+	client  *http.Client
+
+	identityMu     sync.Mutex
+	identitySynced bool
+	syncedSelf     string
+	syncedLIDs     int
 }
 
 func getEnvOrDefault(key, fallback string) string {
@@ -228,164 +238,161 @@ func saveQRCodeArtifacts(codeText string) {
 	}
 }
 
+// Convex identifies the Convex deployment that holds WhatsApp data and the write
+// token the bridge presents on every call.
+func getConvexURL() string {
+	return strings.TrimRight(getEnvOrDefault("WHATSAPP_CONVEX_URL", "http://127.0.0.1:3210"), "/")
+}
+
+// resolveConvexWriteToken reads the write token from the environment, else once
+// from the macOS Keychain.
+func resolveConvexWriteToken() (string, error) {
+	if token := strings.TrimSpace(os.Getenv("WHATSAPP_CONVEX_WRITE_TOKEN")); token != "" {
+		return token, nil
+	}
+	out, err := exec.Command("security", "find-generic-password", "-a", "near", "-s", "n4.convex-write", "-w").Output()
+	if token := strings.TrimSpace(string(out)); err == nil && token != "" {
+		return token, nil
+	}
+	return "", fmt.Errorf("no Convex write token: set WHATSAPP_CONVEX_WRITE_TOKEN or add the Keychain item (account near, service n4.convex-write)")
+}
+
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
-	// Create directory for database if it doesn't exist
-	storeDir := getStoreDir()
-	if err := os.MkdirAll(storeDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create store directory: %v", err)
-	}
-
-	// Open SQLite database for messages
-	messagesDBPath := filepath.Join(storeDir, "messages.db")
-	db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?_foreign_keys=on", messagesDBPath))
+	token, err := resolveConvexWriteToken()
 	if err != nil {
-		return nil, fmt.Errorf("failed to open message database: %v", err)
+		return nil, err
 	}
-
-	// Create tables if they don't exist
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS chats (
-			jid TEXT PRIMARY KEY,
-			name TEXT,
-			last_message_time TIMESTAMP
-		);
-
-		CREATE TABLE IF NOT EXISTS messages (
-			id TEXT,
-			chat_jid TEXT,
-			sender TEXT,
-			content TEXT,
-			timestamp TIMESTAMP,
-			is_from_me BOOLEAN,
-			media_type TEXT,
-			reply_to_message_id TEXT,
-			reply_to_sender TEXT,
-			reply_to_content TEXT,
-			reply_to_media_type TEXT,
-			filename TEXT,
-			url TEXT,
-			media_key BLOB,
-			file_sha256 BLOB,
-			file_enc_sha256 BLOB,
-			file_length INTEGER,
-			edited_at TIMESTAMP,
-			PRIMARY KEY (id, chat_jid),
-			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
-		);
-
-		CREATE TABLE IF NOT EXISTS message_reactions (
-			chat_jid TEXT NOT NULL,
-			target_message_id TEXT NOT NULL,
-			target_sender TEXT NOT NULL DEFAULT '',
-			reaction_sender TEXT NOT NULL,
-			emoji TEXT NOT NULL,
-			reaction_message_id TEXT,
-			grouping_key TEXT,
-			sender_timestamp_ms INTEGER,
-			timestamp TIMESTAMP,
-			is_from_me BOOLEAN,
-			PRIMARY KEY (chat_jid, target_message_id, reaction_sender)
-		);
-
-		CREATE TABLE IF NOT EXISTS message_receipts (
-			message_id TEXT NOT NULL,
-			chat_jid TEXT NOT NULL,
-			receipt_type TEXT NOT NULL,
-			receipt_sender TEXT NOT NULL,
-			message_sender TEXT NOT NULL DEFAULT '',
-			timestamp TIMESTAMP,
-			PRIMARY KEY (message_id, chat_jid, receipt_type, receipt_sender, message_sender)
-		);
-
-		CREATE INDEX IF NOT EXISTS idx_message_reactions_target
-			ON message_reactions (chat_jid, target_message_id);
-
-		CREATE INDEX IF NOT EXISTS idx_message_receipts_message
-			ON message_receipts (chat_jid, message_id);
-	`)
-	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to create tables: %v", err)
-	}
-
-	if err := ensureMessageSchema(db); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to migrate message schema: %v", err)
-	}
-
-	return &MessageStore{db: db}, nil
+	return &MessageStore{
+		baseURL: getConvexURL(),
+		token:   token,
+		client:  &http.Client{Timeout: 30 * time.Second},
+	}, nil
 }
 
-func nullableTime(timestamp time.Time) any {
-	if timestamp.IsZero() {
-		return nil
-	}
-	return timestamp
-}
-
-func ensureMessageSchema(db *sql.DB) error {
-	rows, err := db.Query(`PRAGMA table_info(messages)`)
+// call runs one Convex function ("query" or "mutation") and decodes its value into out.
+func (store *MessageStore) call(kind, name string, args map[string]any, out any) error {
+	args["token"] = store.token
+	body, err := json.Marshal(map[string]any{"path": "whatsapp:" + name, "args": args, "format": "json"})
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	resp, err := store.client.Post(store.baseURL+"/api/"+kind, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("convex whatsapp:%s: %v", name, err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("convex whatsapp:%s: %v", name, err)
+	}
 
-	existing := make(map[string]bool)
-	for rows.Next() {
-		var cid int
-		var name string
-		var columnType string
-		var notNull int
-		var defaultValue sql.NullString
-		var pk int
-		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
-			return err
+	var result struct {
+		Status       string          `json:"status"`
+		Value        json.RawMessage `json:"value"`
+		ErrorMessage string          `json:"errorMessage"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil || result.Status != "success" {
+		message := result.ErrorMessage
+		if message == "" {
+			message = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 		}
-		existing[name] = true
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	requiredColumns := []struct {
-		name string
-		def  string
-	}{
-		{name: "reply_to_message_id", def: "TEXT"},
-		{name: "reply_to_sender", def: "TEXT"},
-		{name: "reply_to_content", def: "TEXT"},
-		{name: "reply_to_media_type", def: "TEXT"},
-		{name: "edited_at", def: "TIMESTAMP"},
-	}
-
-	for _, column := range requiredColumns {
-		if existing[column.name] {
-			continue
+		// Argument-validation errors can echo the arguments; never log the token.
+		message = strings.ReplaceAll(message, store.token, "[token]")
+		if len(message) > 500 {
+			message = message[:500] + "..."
 		}
-		if _, err := db.Exec(fmt.Sprintf("ALTER TABLE messages ADD COLUMN %s %s", column.name, column.def)); err != nil {
-			return err
-		}
+		return fmt.Errorf("convex whatsapp:%s: %s", name, message)
 	}
-
+	if out != nil {
+		return json.Unmarshal(result.Value, out)
+	}
 	return nil
 }
 
-// Close the database connection
+func (store *MessageStore) mutation(name string, args map[string]any, out any) error {
+	return store.call("mutation", name, args, out)
+}
+
+func (store *MessageStore) query(name string, args map[string]any, out any) error {
+	return store.call("query", name, args, out)
+}
+
+// Optional Convex fields are omitted when empty; times are epoch milliseconds and
+// binary fields base64.
+func putString(args map[string]any, key, value string) {
+	if value != "" {
+		args[key] = value
+	}
+}
+
+func putBytes(args map[string]any, key string, value []byte) {
+	if len(value) > 0 {
+		args[key] = base64.StdEncoding.EncodeToString(value)
+	}
+}
+
+func putTime(args map[string]any, key string, value time.Time) {
+	if !value.IsZero() {
+		args[key] = value.UnixMilli()
+	}
+}
+
+func putLength(args map[string]any, key string, value uint64) {
+	if value > 0 {
+		args[key] = value
+	}
+}
+
+func epochMillis(value time.Time) int64 {
+	if value.IsZero() {
+		return 0
+	}
+	return value.UnixMilli()
+}
+
+func fromEpochMillis(value float64) time.Time {
+	return time.UnixMilli(int64(math.Round(value)))
+}
+
+func decodeBase64(value string) []byte {
+	if value == "" {
+		return nil
+	}
+	decoded, err := base64.StdEncoding.DecodeString(value)
+	if err != nil {
+		return nil
+	}
+	return decoded
+}
+
+// Close releases idle connections to Convex.
 func (store *MessageStore) Close() error {
-	return store.db.Close()
+	store.client.CloseIdleConnections()
+	return nil
 }
 
-// Store a chat in the database
+// Store a chat in Convex
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
-	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
-		jid, name, lastMessageTime,
-	)
-	return err
+	args := map[string]any{"jid": jid}
+	putString(args, "name", name)
+	putTime(args, "lastMessageTime", lastMessageTime)
+	return store.mutation("upsertChat", args, nil)
 }
 
-// Store a message in the database
+// ChatName reports a chat's stored name ("" when the chat has none) and whether the chat is known.
+func (store *MessageStore) ChatName(jid string) (string, error) {
+	var name *string
+	if err := store.query("chatName", map[string]any{"jid": jid}, &name); err != nil {
+		return "", err
+	}
+	if name == nil {
+		return "", nil
+	}
+	return *name, nil
+}
+
+// Store a message in Convex
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType string, reply ReplyMetadata, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	// Only store if there's actual content or media
@@ -393,18 +400,31 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		return nil
 	}
 
-	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, reply_to_message_id, reply_to_sender, reply_to_content, reply_to_media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, reply.MessageID, reply.Sender, reply.Content, reply.MediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
-	)
-	return err
+	message := map[string]any{
+		"id":        id,
+		"chatJid":   chatJID,
+		"sender":    sender,
+		"content":   content,
+		"timestamp": epochMillis(timestamp),
+		"isFromMe":  isFromMe,
+	}
+	putString(message, "mediaType", mediaType)
+	putString(message, "replyToMessageId", reply.MessageID)
+	putString(message, "replyToSender", reply.Sender)
+	putString(message, "replyToContent", reply.Content)
+	putString(message, "replyToMediaType", reply.MediaType)
+	putString(message, "filename", filename)
+	putString(message, "url", url)
+	putBytes(message, "mediaKey", mediaKey)
+	putBytes(message, "fileSha256", fileSHA256)
+	putBytes(message, "fileEncSha256", fileEncSHA256)
+	putLength(message, "fileLength", fileLength)
+	return store.mutation("storeMessages", map[string]any{"messages": []map[string]any{message}}, nil)
 }
 
 // ApplyMessageEdit revises a message already on record: it replaces the text and
-// stamps edited_at, and replaces media columns only when the edit actually
-// carries media. Columns the edit says nothing about — the reply it answered,
+// stamps editedAt, and replaces media fields only when the edit actually
+// carries media. Fields the edit says nothing about — the reply it answered,
 // the media a caption belonged to — are left standing. Reports whether a stored
 // message matched.
 func (store *MessageStore) ApplyMessageEdit(
@@ -415,60 +435,50 @@ func (store *MessageStore) ApplyMessageEdit(
 		return false, nil
 	}
 
-	query := `UPDATE messages SET content = ?, edited_at = ?`
-	args := []any{content, editedAt}
+	args := map[string]any{
+		"id":       id,
+		"chatJid":  chatJID,
+		"content":  content,
+		"editedAt": epochMillis(editedAt),
+	}
 	if mediaType != "" {
-		query += `, media_type = ?, filename = ?, url = ?, media_key = ?, file_sha256 = ?, file_enc_sha256 = ?, file_length = ?`
-		args = append(args, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength)
+		putString(args, "mediaType", mediaType)
+		putString(args, "filename", filename)
+		putString(args, "url", url)
+		putBytes(args, "mediaKey", mediaKey)
+		putBytes(args, "fileSha256", fileSHA256)
+		putBytes(args, "fileEncSha256", fileEncSHA256)
+		putLength(args, "fileLength", fileLength)
 	}
-	query += ` WHERE id = ? AND chat_jid = ?`
-	args = append(args, id, chatJID)
 
-	result, err := store.db.Exec(query, args...)
-	if err != nil {
+	var updated bool
+	if err := store.mutation("applyEdit", args, &updated); err != nil {
 		return false, err
 	}
-
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-
-	return affected > 0, nil
+	return updated, nil
 }
 
+// StoreReaction records a sender's current reaction; an empty emoji removes it.
 func (store *MessageStore) StoreReaction(reaction ReactionMetadata) error {
 	if reaction.ChatJID == "" || reaction.TargetMessageID == "" || reaction.Sender == "" {
 		return nil
 	}
 
-	if reaction.Emoji == "" {
-		_, err := store.db.Exec(
-			`DELETE FROM message_reactions
-			WHERE chat_jid = ? AND target_message_id = ? AND reaction_sender = ?`,
-			reaction.ChatJID,
-			reaction.TargetMessageID,
-			reaction.Sender,
-		)
-		return err
+	value := map[string]any{
+		"chatJid":         reaction.ChatJID,
+		"targetMessageId": reaction.TargetMessageID,
+		"targetSender":    reaction.TargetSender,
+		"reactionSender":  reaction.Sender,
+		"emoji":           reaction.Emoji,
+		"isFromMe":        reaction.IsFromMe,
 	}
-
-	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO message_reactions
-		(chat_jid, target_message_id, target_sender, reaction_sender, emoji, reaction_message_id, grouping_key, sender_timestamp_ms, timestamp, is_from_me)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		reaction.ChatJID,
-		reaction.TargetMessageID,
-		reaction.TargetSender,
-		reaction.Sender,
-		reaction.Emoji,
-		reaction.ReactionMessageID,
-		reaction.GroupingKey,
-		reaction.SenderTimestampMS,
-		nullableTime(reaction.Timestamp),
-		reaction.IsFromMe,
-	)
-	return err
+	putString(value, "reactionMessageId", reaction.ReactionMessageID)
+	putString(value, "groupingKey", reaction.GroupingKey)
+	if reaction.SenderTimestampMS != 0 {
+		value["senderTimestampMs"] = reaction.SenderTimestampMS
+	}
+	putTime(value, "timestamp", reaction.Timestamp)
+	return store.mutation("storeReaction", map[string]any{"reaction": value}, nil)
 }
 
 func normalizeReceiptType(receiptType types.ReceiptType) string {
@@ -484,81 +494,157 @@ func (store *MessageStore) StoreReceipt(messageID, chatJID, receiptType, receipt
 		return nil
 	}
 
-	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO message_receipts
-		(message_id, chat_jid, receipt_type, receipt_sender, message_sender, timestamp)
-		VALUES (?, ?, ?, ?, ?, ?)`,
-		messageID,
-		chatJID,
-		receiptType,
-		receiptSender,
-		messageSender,
-		nullableTime(timestamp),
-	)
-	return err
+	value := map[string]any{
+		"messageId":     messageID,
+		"chatJid":       chatJID,
+		"receiptType":   receiptType,
+		"receiptSender": receiptSender,
+		"messageSender": messageSender,
+	}
+	putTime(value, "timestamp", timestamp)
+	return store.mutation("storeReceipt", map[string]any{"receipt": value}, nil)
 }
 
 func (store *MessageStore) GetStoredMessageTimestamp(id, chatJID string) (time.Time, bool, error) {
-	var timestamp time.Time
-	err := store.db.QueryRow(
-		"SELECT timestamp FROM messages WHERE id = ? AND chat_jid = ?",
-		id, chatJID,
-	).Scan(&timestamp)
-	if err == sql.ErrNoRows {
-		return time.Time{}, false, nil
-	}
-	if err != nil {
+	var timestamp *float64
+	if err := store.query("storedTimestamp", map[string]any{"id": id, "chatJid": chatJID}, &timestamp); err != nil {
 		return time.Time{}, false, err
 	}
-	return timestamp, true, nil
+	if timestamp == nil {
+		return time.Time{}, false, nil
+	}
+	return fromEpochMillis(*timestamp), true, nil
 }
 
-// Get messages from a chat
+// Get messages from a chat, newest first
 func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
-	rows, err := store.db.Query(
-		"SELECT sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
-		chatJID, limit,
-	)
-	if err != nil {
+	var rows []struct {
+		Sender    string  `json:"sender"`
+		Content   string  `json:"content"`
+		Timestamp float64 `json:"timestamp"`
+		IsFromMe  bool    `json:"isFromMe"`
+		MediaType string  `json:"mediaType"`
+		Filename  string  `json:"filename"`
+	}
+	if err := store.query("recentMessages", map[string]any{"chatJid": chatJID, "limit": limit}, &rows); err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
 	var messages []Message
-	for rows.Next() {
-		var msg Message
-		var timestamp time.Time
-		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename)
-		if err != nil {
-			return nil, err
-		}
-		msg.Time = timestamp
-		messages = append(messages, msg)
+	for _, row := range rows {
+		messages = append(messages, Message{
+			Time:      fromEpochMillis(row.Timestamp),
+			Sender:    row.Sender,
+			Content:   row.Content,
+			IsFromMe:  row.IsFromMe,
+			MediaType: row.MediaType,
+			Filename:  row.Filename,
+		})
 	}
-
 	return messages, nil
 }
 
 // Get all chats
 func (store *MessageStore) GetChats() (map[string]time.Time, error) {
-	rows, err := store.db.Query("SELECT jid, last_message_time FROM chats ORDER BY last_message_time DESC")
+	var rows []struct {
+		JID             string  `json:"jid"`
+		LastMessageTime float64 `json:"lastMessageTime"`
+	}
+	if err := store.query("chatTimes", map[string]any{}, &rows); err != nil {
+		return nil, err
+	}
+
+	chats := make(map[string]time.Time)
+	for _, row := range rows {
+		if row.LastMessageTime == 0 {
+			chats[row.JID] = time.Time{}
+			continue
+		}
+		chats[row.JID] = fromEpochMillis(row.LastMessageTime)
+	}
+	return chats, nil
+}
+
+// LIDPair maps a WhatsApp LID user to its phone-number user, as whatsmeow stores it.
+type LIDPair struct {
+	LID string `json:"lid"`
+	PN  string `json:"pn"`
+}
+
+// SetIdentity records the account's own JID and its LID <-> phone map in batches.
+func (store *MessageStore) SetIdentity(self string, lids []LIDPair) error {
+	const batchSize = 500
+	for start := 0; start == 0 || start < len(lids); start += batchSize {
+		end := min(start+batchSize, len(lids))
+		args := map[string]any{"lids": append([]LIDPair{}, lids[start:end]...)}
+		if start == 0 {
+			putString(args, "self", self)
+		}
+		if err := store.mutation("setIdentity", args, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readLIDMap reads whatsmeow's LID <-> phone map from the session store, read-only.
+func readLIDMap() ([]LIDPair, error) {
+	db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?mode=ro", filepath.Join(getStoreDir(), "whatsapp.db")))
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT lid, pn FROM whatsmeow_lid_map")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	chats := make(map[string]time.Time)
+	var pairs []LIDPair
 	for rows.Next() {
-		var jid string
-		var lastMessageTime time.Time
-		err := rows.Scan(&jid, &lastMessageTime)
-		if err != nil {
+		var pair LIDPair
+		if err := rows.Scan(&pair.LID, &pair.PN); err != nil {
 			return nil, err
 		}
-		chats[jid] = lastMessageTime
+		if pair.LID != "" && pair.PN != "" {
+			pairs = append(pairs, pair)
+		}
+	}
+	return pairs, rows.Err()
+}
+
+// syncIdentity sends the account's own JID (without device suffix) and the LID map
+// to Convex, skipping the map when it has not grown since the last successful sync.
+func syncIdentity(client *whatsmeow.Client, store *MessageStore, logger waLog.Logger) {
+	if store == nil {
+		return
+	}
+	self := ""
+	if client != nil && client.Store != nil && client.Store.ID != nil {
+		self = client.Store.ID.User + "@" + client.Store.ID.Server
+	}
+	lids, err := readLIDMap()
+	if err != nil {
+		logger.Warnf("Failed to read LID map: %v", err)
+	}
+	if self == "" && len(lids) == 0 {
+		return
 	}
 
-	return chats, nil
+	store.identityMu.Lock()
+	defer store.identityMu.Unlock()
+	if store.identitySynced && self == store.syncedSelf && len(lids) == store.syncedLIDs {
+		return
+	}
+	if err := store.SetIdentity(self, lids); err != nil {
+		logger.Warnf("Failed to store identity: %v", err)
+		return
+	}
+	store.identitySynced = true
+	store.syncedSelf = self
+	store.syncedLIDs = len(lids)
+	logger.Infof("Stored identity with %d LID mappings", len(lids))
 }
 
 type visibleTextCollector struct {
@@ -1283,7 +1369,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 
 // Persist a message this bridge just sent. whatsmeow emits no Message event
 // for the client's own sends, so without this explicit insert outbound bridge
-// messages never reach the local store.
+// messages never reach the store.
 func storeSentMessage(store *MessageStore, sender string, chat types.JID, messageID string, timestamp time.Time, msg *waProto.Message, reply ReplyMetadata) error {
 	if store == nil || messageID == "" || msg == nil {
 		return nil
@@ -1291,8 +1377,7 @@ func storeSentMessage(store *MessageStore, sender string, chat types.JID, messag
 
 	chatJID := chat.String()
 	name := chat.User
-	var existingName string
-	if err := store.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName); err == nil && existingName != "" {
+	if existingName, err := store.ChatName(chatJID); err == nil && existingName != "" {
 		name = existingName
 	}
 	if err := store.StoreChat(chatJID, name, timestamp); err != nil {
@@ -1528,14 +1613,14 @@ func storeEventMessage(client *whatsmeow.Client, messageStore *MessageStore, evt
 
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
-	// Save message to database
+	// Save message to the store
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, directChatNameHintsFromMessage(msg.Info), logger)
 
-	// Update chat in database with the message timestamp (keeps last message time updated)
+	// Update the chat with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
 	if err != nil {
 		logger.Warnf("Failed to store chat: %v", err)
@@ -1706,27 +1791,36 @@ type DownloadMediaResponse struct {
 	Path     string `json:"path,omitempty"`
 }
 
-// Store additional media info in the database
+// Store additional media info in Convex
 func (store *MessageStore) StoreMediaInfo(id, chatJID, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
-	_, err := store.db.Exec(
-		"UPDATE messages SET url = ?, media_key = ?, file_sha256 = ?, file_enc_sha256 = ?, file_length = ? WHERE id = ? AND chat_jid = ?",
-		url, mediaKey, fileSHA256, fileEncSHA256, fileLength, id, chatJID,
-	)
-	return err
+	args := map[string]any{"id": id, "chatJid": chatJID}
+	putString(args, "url", url)
+	putBytes(args, "mediaKey", mediaKey)
+	putBytes(args, "fileSha256", fileSHA256)
+	putBytes(args, "fileEncSha256", fileEncSHA256)
+	putLength(args, "fileLength", fileLength)
+	return store.mutation("storeMediaInfo", args, nil)
 }
 
-// Get media info from the database
+// Get media info from Convex; an unknown message reports sql.ErrNoRows as the SQLite store did.
 func (store *MessageStore) GetMediaInfo(id, chatJID string) (string, string, string, []byte, []byte, []byte, uint64, error) {
-	var mediaType, filename, url string
-	var mediaKey, fileSHA256, fileEncSHA256 []byte
-	var fileLength uint64
-
-	err := store.db.QueryRow(
-		"SELECT media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length FROM messages WHERE id = ? AND chat_jid = ?",
-		id, chatJID,
-	).Scan(&mediaType, &filename, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength)
-
-	return mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err
+	var info *struct {
+		MediaType     string  `json:"mediaType"`
+		Filename      string  `json:"filename"`
+		URL           string  `json:"url"`
+		MediaKey      string  `json:"mediaKey"`
+		FileSHA256    string  `json:"fileSha256"`
+		FileEncSHA256 string  `json:"fileEncSha256"`
+		FileLength    float64 `json:"fileLength"`
+	}
+	if err := store.query("mediaInfo", map[string]any{"id": id, "chatJid": chatJID}, &info); err != nil {
+		return "", "", "", nil, nil, nil, 0, err
+	}
+	if info == nil {
+		return "", "", "", nil, nil, nil, 0, sql.ErrNoRows
+	}
+	return info.MediaType, info.Filename, info.URL, decodeBase64(info.MediaKey), decodeBase64(info.FileSHA256),
+		decodeBase64(info.FileEncSHA256), uint64(math.Max(0, info.FileLength)), nil
 }
 
 // MediaDownloader implements the whatsmeow.DownloadableMessage interface
@@ -1777,7 +1871,7 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 
 // Function to download media from a message
 func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
-	// Query the database for the message
+	// Look up the message in the store
 	var mediaType, filename, url string
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
 	var fileLength uint64
@@ -1787,19 +1881,11 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	chatDir := filepath.Join(getStoreDir(), strings.ReplaceAll(chatJID, ":", "_"))
 	localPath := ""
 
-	// Get media info from the database
+	// Get media info from the store
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err = messageStore.GetMediaInfo(messageID, chatJID)
 
 	if err != nil {
-		// Try to get basic info if extended info isn't available
-		err = messageStore.db.QueryRow(
-			"SELECT media_type, filename FROM messages WHERE id = ? AND chat_jid = ?",
-			messageID, chatJID,
-		).Scan(&mediaType, &filename)
-
-		if err != nil {
-			return false, "", "", "", fmt.Errorf("failed to find message: %v", err)
-		}
+		return false, "", "", "", fmt.Errorf("failed to find message: %v", err)
 	}
 
 	// Check if this is a media message
@@ -2090,7 +2176,7 @@ func main() {
 	// Initialize message store
 	messageStore, err := NewMessageStore()
 	if err != nil {
-		logger.Errorf("Failed to initialize message store: %v", err)
+		logger.Errorf("Failed to initialize Convex message store: %v", err)
 		return
 	}
 	defer messageStore.Close()
@@ -2209,6 +2295,7 @@ func main() {
 		logger.Errorf("Failed to establish stable connection")
 		return
 	}
+	syncIdentity(client, messageStore, logger)
 	refreshFallbackDirectChatNames(client, messageStore, logger)
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
@@ -2356,8 +2443,8 @@ func refreshFallbackDirectChatNames(client *whatsmeow.Client, messageStore *Mess
 			continue
 		}
 
-		var existingName string
-		if err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName); err != nil {
+		existingName, err := messageStore.ChatName(chatJID)
+		if err != nil {
 			continue
 		}
 		if !isFallbackDirectChatName(existingName, jid, jid.User) {
@@ -2386,9 +2473,8 @@ func refreshFallbackDirectChatNames(client *whatsmeow.Client, messageStore *Mess
 
 // GetChatName determines the appropriate name for a chat based on JID and other info.
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, hints directChatNameHints, logger waLog.Logger) string {
-	// First, check if chat already exists in database with a name
-	var existingName string
-	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
+	// First, check if the chat is already stored with a name
+	existingName, err := messageStore.ChatName(chatJID)
 	if err == nil && existingName != "" && (jid.Server == "g.us" || !isFallbackDirectChatName(existingName, jid, hints.Sender)) {
 		// Chat exists with a name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
@@ -2552,6 +2638,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	}
 
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+	syncIdentity(client, messageStore, logger)
 	runMediaReconcileHook(logger)
 }
 
