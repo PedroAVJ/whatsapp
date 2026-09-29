@@ -33,9 +33,9 @@ This project is unofficial and is not affiliated with WhatsApp or Meta.
 - Node.js and pnpm
 - `uv` for the vendored Python MCP backend
 - an installed `elevenlabs` CLI for arrival-triggered audio transcription
-- the `macos@package-manager` Apple Contacts plugin for person and
+- the `macos@near` Apple Contacts plugin for person and
   relationship identity resolution
-- the `elevenlabs@package-manager` plugin, which provides the `elevenlabs` CLI
+- the `elevenlabs@near` plugin, which provides the `elevenlabs` CLI
 
 ## Install
 
@@ -110,14 +110,14 @@ history, and older messages may remain available only on the primary phone.
 Install the user's unified catalog as a Codex marketplace, then install the `whatsapp` plugin from the Plugins screen.
 
 ```bash
-codex plugin marketplace add PedroAVJ/package-manager --ref main
+codex plugin marketplace add PedroAVJ/near --ref main
 codex plugin marketplace upgrade
 ```
 
 In the Codex app, the equivalent Add marketplace values are:
 
 ```text
-Source: PedroAVJ/package-manager
+Source: PedroAVJ/near
 Git ref: main
 Sparse paths: (leave blank)
 ```
@@ -238,7 +238,7 @@ note. Pass `--retry-failed` only to explicitly retry an item previously
 classified as permanently unavailable.
 
 Transcription uses an installed ElevenLabs CLI at runtime. Claude installs that
-dependency as `elevenlabs@package-manager`, while the CLI still resolves it from
+dependency as `elevenlabs@near`, while the CLI still resolves it from
 `PATH` without reaching into a versioned plugin cache. It requires
 `ELEVENLABS_API_KEY` only on cache misses. A per-message process lock prevents
 duplicate delivery paths from spending twice, and transient arrival failures

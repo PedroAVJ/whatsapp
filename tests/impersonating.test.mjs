@@ -22,7 +22,7 @@ test("impersonating is a discoverable WhatsApp skill without retired owners", as
 
 test("no bundled surface points at the retired writing or models plugins", async () => {
   const claude = JSON.parse(await readFile(join(root, ".claude-plugin", "plugin.json"), "utf8"));
-  assert.deepEqual(claude.dependencies, ["elevenlabs@package-manager", "macos@package-manager"]);
+  assert.deepEqual(claude.dependencies, ["elevenlabs@near", "macos@near"]);
   for (const path of [
     "README.md",
     "skills/whatsapp/SKILL.md",
@@ -30,7 +30,7 @@ test("no bundled surface points at the retired writing or models plugins", async
     "skills/impersonating/SKILL.md",
   ]) {
     const text = await readFile(join(root, path), "utf8");
-    assert.doesNotMatch(text, /writing:impersonating|writing@package-manager|models@package-manager/, path);
+    assert.doesNotMatch(text, /writing:impersonating|writing@near|models@near/, path);
   }
 });
 
