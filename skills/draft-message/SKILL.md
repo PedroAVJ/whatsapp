@@ -1,15 +1,15 @@
 ---
 name: draft-message
-description: Prepare a WhatsApp user-voice message or reply by collecting live, bounded outbound examples from the target chat and a safe global baseline, then use writing:impersonating for the wording. Use when the user asks to reply as themselves, write in their own voice, or correct a WhatsApp draft that does not sound like them. Do not use to imitate the user in a disclosed agent-authored conversation.
+description: Prepare a WhatsApp user-voice message or reply by collecting live, bounded outbound examples from the target chat and a safe global baseline, then use whatsapp:impersonating for the wording. Use when the user asks to reply as themselves, write in their own voice, or correct a WhatsApp draft that does not sound like them. Do not use to imitate the user in a disclosed agent-authored conversation.
 ---
 
 # Prepare a WhatsApp User-Voice Draft
 
 Use this adapter together with the bundled `whatsapp` skill and
-`writing:impersonating`. WhatsApp owns chat resolution, relationship
-boundaries, source context, reviewable drafts, approval, and live sends. Writing
-is the canonical owner of the user's voice and final wording. This adapter only
-collects the WhatsApp-specific evidence Writing needs.
+`whatsapp:impersonating`. WhatsApp owns chat resolution, relationship
+boundaries, source context, reviewable drafts, approval, and live sends.
+Impersonating is the canonical owner of the user's voice and final wording. This
+adapter only collects the WhatsApp-specific evidence Impersonating needs.
 
 Default to a local reviewable draft. Never treat a request to draft as
 permission to send.
@@ -48,9 +48,9 @@ Treat fewer than five usable per-contact messages as sparse evidence. A single
 message can demonstrate a possibility but cannot prove an `always` or `never`
 rule.
 
-## Draft with Writing
+## Draft with Impersonating
 
-The active assistant drafts directly using `writing:impersonating`; no Claude
+The active assistant drafts directly using `whatsapp:impersonating`; no Claude
 or other model delegation is required. Use only:
 
 - the user's exact objective, current wording, corrections, and verified facts;
@@ -60,14 +60,14 @@ or other model delegation is required. Use only:
 - three to eight nonsensitive global examples only when they materially help.
 
 Do not hand over an entire chat history. Target-chat evidence overrides the
-global baseline for that recipient. Writing owns the evidence order, style
+global baseline for that recipient. Impersonating owns the evidence order, style
 inference, cross-channel fallback, and final check for assistant-like wording.
 Factual correctness and the user's current intent override imitation.
 
 If the user explicitly asks Claude to write the message, follow Claude's relay
 contract: preserve the user's latest request verbatim and append only the compact style
 context under `[Context from Codex]`. Review the result through
-`writing:impersonating` before presenting it.
+`whatsapp:impersonating` before presenting it.
 
 ## Preserve reviewability
 

@@ -47,8 +47,9 @@ test("WhatsApp safely adapts bounded evidence into canonical Writing voice", asy
   assert.match(skill, /romantic-partner chat defaults to disclosed mode/i);
   assert.match(skill, /Never hard-code a contact/i);
   assert.match(skill, /Create or update a local WhatsApp draft/i);
-  assert.match(skill, /writing:impersonating/i);
-  assert.match(skill, /Writing\s+is the canonical owner/i);
+  assert.match(skill, /whatsapp:impersonating/i);
+  assert.doesNotMatch(skill, /writing:impersonating/i);
+  assert.match(skill, /Impersonating\s+is the canonical owner/i);
   assert.match(metadata, /allow_implicit_invocation: true/);
   assert.match(metadata, /Use \$draft-message/);
   assert.match(metadata, /\$draft-user-voice/);

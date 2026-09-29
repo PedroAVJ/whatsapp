@@ -35,7 +35,7 @@ This project is unofficial and is not affiliated with WhatsApp or Meta.
 - an installed `elevenlabs` CLI for arrival-triggered audio transcription
 - the `macos@package-manager` Apple Contacts plugin for person and
   relationship identity resolution
-- the `writing@package-manager` plugin for canonical user-voice wording
+- the `elevenlabs@package-manager` plugin, which provides the `elevenlabs` CLI
 
 ## Install
 
@@ -238,7 +238,7 @@ note. Pass `--retry-failed` only to explicitly retry an item previously
 classified as permanently unavailable.
 
 Transcription uses an installed ElevenLabs CLI at runtime. Claude installs that
-dependency as `models@package-manager`, while the CLI still resolves it from
+dependency as `elevenlabs@package-manager`, while the CLI still resolves it from
 `PATH` without reaching into a versioned plugin cache. It requires
 `ELEVENLABS_API_KEY` only on cache misses. A per-message process lock prevents
 duplicate delivery paths from spending twice, and transient arrival failures
@@ -262,8 +262,9 @@ Drafts are local review artifacts stored in SQLite. They do not create WhatsApp'
 The bundled `draft-message` skill collects bounded WhatsApp evidence for a
 user-voice draft, giving the target chat the strongest weight and excluding
 sensitive examples. It passes that evidence to
-`writing:impersonating`, the canonical cross-channel owner of the user's
-wording. The adapter does not change the romantic-partner or
+the bundled `whatsapp:impersonating` skill, the canonical cross-channel owner
+of the user's wording. Impersonating also serves other channels, such as
+Messages samples from `macos:messages-writing-samples`, email, and forms. The adapter does not change the romantic-partner or
 disclosed-delegation boundaries below.
 
 ```bash

@@ -1,7 +1,7 @@
 {
   "name": "whatsapp",
-  "version": "0.11.15",
-  "description": "Use the installed whatsapp CLI with Apple Contacts identity verification for WhatsApp chats, media, guarded drafts, and approval-gated disclosed messages.",
+  "version": "0.12.0",
+  "description": "Use the installed whatsapp CLI with Apple Contacts identity verification for WhatsApp chats, media, guarded drafts, user-voice wording for any channel, and approval-gated disclosed messages.",
   "author": {
     "name": "PedroAVJ",
     "url": "https://github.com/PedroAVJ"
@@ -14,12 +14,13 @@
     "messages",
     "chat",
     "media",
-    "drafts"
+    "drafts",
+    "writing",
+    "user-voice"
   ],
   "skills": "./skills/",
   "dependencies": [
-    "macos@package-manager",
-    "models@package-manager",
-    "writing@package-manager"
+    "elevenlabs@package-manager",
+    "macos@package-manager"
   ]
 }

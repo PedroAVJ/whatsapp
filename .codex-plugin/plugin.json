@@ -1,7 +1,7 @@
 {
   "name": "whatsapp",
-  "version": "0.11.15",
-  "description": "Use the installed whatsapp CLI with Apple Contacts identity verification for WhatsApp chats, media, guarded drafts, and approval-gated disclosed messages.",
+  "version": "0.12.0",
+  "description": "Use the installed whatsapp CLI with Apple Contacts identity verification for WhatsApp chats, media, guarded drafts, user-voice wording for any channel, and approval-gated disclosed messages.",
   "author": {
     "name": "PedroAVJ",
     "url": "https://github.com/PedroAVJ"
@@ -14,13 +14,15 @@
     "messages",
     "chat",
     "media",
-    "drafts"
+    "drafts",
+    "writing",
+    "user-voice"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "WhatsApp",
     "shortDescription": "Read WhatsApp and coordinate guarded messages",
-    "longDescription": "Use Apple Contacts and exact phone matching to resolve people safely, then use the installed whatsapp CLI and local bridge to read targeted conversation context, inspect media, create reviewable drafts, and send one disclosed agent-authored message when the user gives a clear one-message send command.",
+    "longDescription": "Use Apple Contacts and exact phone matching to resolve people safely, then use the installed whatsapp CLI and local bridge to read targeted conversation context, inspect media, create reviewable drafts, and send one disclosed agent-authored message when the user gives a clear one-message send command. The bundled Impersonating skill drafts in the user's own voice from relevant user-authored evidence for WhatsApp, Messages, email, forms, and other channels.",
     "developerName": "PedroAVJ",
     "category": "Communication",
     "capabilities": [

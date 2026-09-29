@@ -176,8 +176,8 @@ Choose the send mode before writing:
 - **Disclosed delegated conversation:** the user wants an agent-authored message to a named or clearly resolved recipient for a stated objective. Start the first message with a natural disclosure such as "Hola, soy Codex, el asistente de la persona que me pidió escribirte" and write in the agent's own voice; never imply that the user personally typed it. A current one-message instruction to send, tell, ask, reply, or let a clear recipient know something authorizes the agent to compose and send that one disclosed message; the exact wording need not be preapproved. Use a local draft and dry-run as internal safeguards when useful, but do not stop at the draft merely because the user left the wording to the agent. A request only to draft, write, or prepare a message does not authorize a live send. Broad continuing delegation such as "handle the conversation" or "keep going" does not authorize future messages.
 
 For a user-voice draft, use the bundled `draft-message` adapter together with
-`writing:impersonating`. The adapter gathers bounded WhatsApp evidence and
-Writing owns the wording; neither weakens the relationship, approval, or send
+`whatsapp:impersonating`. The adapter gathers bounded WhatsApp evidence and
+Impersonating owns the wording; neither weakens the relationship, approval, or send
 rules here.
 
 ### Romantic-partner boundary

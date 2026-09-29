@@ -1,0 +1,6 @@
+interface:
+  display_name: "Impersonating"
+  short_description: "Write in my voice from relevant examples"
+  default_prompt: "Use $impersonating to write this directly in my style from relevant user-authored evidence."
+policy:
+  allow_implicit_invocation: true
