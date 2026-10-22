@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>@BUNDLE_ID@</string>
+  <key>BundleProgram</key>
+  <string>Contents/MacOS/whatsapp-bridge</string>
+  <key>WorkingDirectory</key>
+  <string>@STATE_ROOT@</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>@HOME@</string>
+    <key>PATH</key><string>@HOME@/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>WHATSAPP_MCP_STORE_DIR</key><string>@STATE_ROOT@/upstream-store</string>
+    <key>WHATSAPP_MCP_HTTP_PORT</key><string>@HTTP_PORT@</string>
+    <key>WHATSAPP_MCP_API_BASE_URL</key><string>http://127.0.0.1:@HTTP_PORT@/api</string>
+    <key>WHATSAPP_MCP_QR_TEXT_PATH</key><string>@STATE_ROOT@/upstream-qr.txt</string>
+    <key>WHATSAPP_MCP_QR_PNG_PATH</key><string>@STATE_ROOT@/upstream-qr.png</string>
+    <key>WHATSAPP_MEDIA_ARRIVAL_HOOK</key><string>@CLI@</string>
+    <key>WHATSAPP_MEDIA_ARRIVAL_HOOK_TYPES</key><string>audio</string>
+    <key>WHATSAPP_MEDIA_RECONCILE_HOOK</key><string>@CLI@</string>
+    <key>WHATSAPP_MEDIA_RECONCILE_LIMIT</key><string>50</string>
+    <key>WHATSAPP_MEDIA_RECONCILE_LOOKBACK_DAYS</key><string>14</string>
+    <key>WHATSAPP_MEDIA_RECONCILE_TIMEOUT_MINUTES</key><string>240</string>
+  </dict>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>@HOME@/Library/Logs/whatsapp-bridge.log</string>
+  <key>StandardErrorPath</key>
+  <string>@HOME@/Library/Logs/whatsapp-bridge.log</string>
+</dict>
+</plist>

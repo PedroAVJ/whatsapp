@@ -863,3 +863,44 @@ test("reset-sync relinks the session but keeps message history", () => {
     fs.rmSync(stateRoot, { recursive: true, force: true });
   }
 });
+
+test("the macOS app owns the bridge's launch agent through SMAppService", () => {
+  const appDir = path.join(pluginRoot, "macos-app");
+  const swift = fs.readFileSync(path.join(appDir, "main.swift"), "utf8");
+  const agent = fs.readFileSync(path.join(appDir, "LaunchAgent.plist"), "utf8");
+  const info = fs.readFileSync(path.join(appDir, "Info.plist"), "utf8");
+  const build = fs.readFileSync(path.join(appDir, "build.sh"), "utf8");
+
+  assert.match(swift, /SMAppService\.agent\(plistName: plistName\)/);
+  assert.match(swift, /openSystemSettingsLoginItems\(\)/, "approval is surfaced, never skipped silently");
+  assert.match(swift, /job_owned_by_app/, "a same-label plist outside the app is not reported as the app's agent");
+  assert.match(agent, /<key>BundleProgram<\/key>\s*<string>Contents\/MacOS\/whatsapp-bridge<\/string>/);
+  assert.match(agent, /<key>Label<\/key>\s*<string>@BUNDLE_ID@<\/string>/);
+  assert.match(info, /<key>CFBundleIdentifier<\/key>\s*<string>@BUNDLE_ID@<\/string>/);
+  assert.match(build, /Contents\/Library\/LaunchAgents\/\{bundle_id\}\.plist/);
+  assert.match(build, /codesign --verify --strict --deep/);
+  assert.match(build, /mv "\$STAGE" "\$APP"/, "the bundle is swapped in whole, never patched under a running bridge");
+
+  // The agent runs the bridge with the same environment the lifecycle scripts export.
+  for (const key of [
+    "WHATSAPP_MCP_STORE_DIR",
+    "WHATSAPP_MCP_HTTP_PORT",
+    "WHATSAPP_MCP_API_BASE_URL",
+    "WHATSAPP_MCP_QR_TEXT_PATH",
+    "WHATSAPP_MCP_QR_PNG_PATH",
+    "WHATSAPP_MEDIA_ARRIVAL_HOOK",
+    "WHATSAPP_MEDIA_ARRIVAL_HOOK_TYPES",
+    "WHATSAPP_MEDIA_RECONCILE_HOOK",
+    "WHATSAPP_MEDIA_RECONCILE_LIMIT",
+    "WHATSAPP_MEDIA_RECONCILE_LOOKBACK_DAYS",
+    "WHATSAPP_MEDIA_RECONCILE_TIMEOUT_MINUTES",
+  ]) {
+    assert.match(agent, new RegExp(`<key>${key}</key>`), key);
+  }
+  assert.match(agent, /@STATE_ROOT@\/upstream-store/);
+  assert.doesNotMatch(agent + info, /\/Users\//, "templates carry no personal paths");
+
+  if (process.platform === "darwin") {
+    execFileSync("plutil", ["-lint", path.join(appDir, "LaunchAgent.plist"), path.join(appDir, "Info.plist")]);
+  }
+});

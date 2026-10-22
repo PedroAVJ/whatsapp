@@ -153,6 +153,16 @@ class MessageStoreReadTests(StoreFixture):
         row = STORE.query("lastInteraction", {"jid": "15551230001@s.whatsapp.net"})
         self.assertEqual("p-2", row["id"])
 
+    def test_reads_work_while_the_bridge_is_stopped(self):
+        # The bridge keeps messages.db in WAL mode; after it exits the -wal and -shm
+        # sidecars are gone, and a read-only reader must still open the file.
+        path = pathlib.Path(self.temp.name) / "messages.db"
+        conn = sqlite3.connect(path)
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.close()
+        self.assertFalse(path.with_name("messages.db-wal").exists())
+        self.assertEqual(4, len(STORE.query("chats", {"includeLast": False})))
+
     def test_reads_are_read_only(self):
         conn = STORE.connect()
         with self.assertRaises(sqlite3.OperationalError):

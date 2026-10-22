@@ -311,6 +311,34 @@ Important environment variables:
 - `WHATSAPP_MCP_REQUEST_FULL_HISTORY`: request WhatsApp's maximum linked-device history during fresh pairing (setup defaults to `1`).
 - `WHATSAPP_MCP_HISTORY_SYNC_TIMEOUT_SECS`: maximum setup wait for the full-history stream (default `600`).
 
+## macOS app
+
+On macOS the bridge can run as `WhatsApp Bridge.app`, which owns its launch
+agent instead of a hand-written plist in `~/Library/LaunchAgents`. The bundle
+holds the bridge binary (`Contents/MacOS/whatsapp-bridge`) and the agent plist
+(`Contents/Library/LaunchAgents/<bundle id>.plist`, run through
+`BundleProgram`); the app's own executable registers that agent with
+`SMAppService`.
+
+```bash
+macos-app/build.sh      # builds, signs, and installs ~/Applications/WhatsApp Bridge.app
+"$HOME/Applications/WhatsApp Bridge.app/Contents/MacOS/WhatsApp Bridge" register
+"$HOME/Applications/WhatsApp Bridge.app/Contents/MacOS/WhatsApp Bridge" status
+```
+
+Opening the app from Finder registers the agent and shows the result. If macOS
+wants approval, the app opens System Settings > General > Login Items &
+Extensions and says so. `status` prints the registration state, whether the
+loaded job is really the app's (a leftover plist with the same label is
+reported, not mistaken for it), and `/api/health`. The agent keeps the label
+`com.pedro.whatsapp-bridge` (override with `BUNDLE_ID`), the state root, store
+directory, port, media hooks, and log file of the plain launch agent. Background
+Task Management keys items by label, so boot out a plain agent with the same
+label and remove its plist from `~/Library/LaunchAgents` before registering;
+the app refuses while either is still there. Rebuilding swaps the
+bundle in one move and restarts a registered agent; it never touches
+`whatsapp.db`, so the linked device stays paired.
+
 ## Upgrading an earlier store
 
 Releases 0.11.14 to 0.12.1 kept WhatsApp data in a Near Convex deployment instead
