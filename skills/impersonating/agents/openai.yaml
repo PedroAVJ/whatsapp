@@ -1,0 +1,6 @@
+interface:
+  display_name: "Impersonating"
+  short_description: "Write WhatsApp messages in my voice"
+  default_prompt: "Use $impersonating to write this WhatsApp message directly in my style from relevant user-authored evidence."
+policy:
+  allow_implicit_invocation: true

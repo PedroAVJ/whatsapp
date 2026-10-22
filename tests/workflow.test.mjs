@@ -33,7 +33,7 @@ test("WhatsApp hygiene owns bounded inbound discovery", async () => {
   assert.match(skill, /Finish keep and\s+no-action items silently/i);
 });
 
-test("WhatsApp safely adapts bounded evidence into canonical Writing voice", async () => {
+test("WhatsApp safely adapts bounded evidence into the bundled Impersonating voice", async () => {
   const skill = await readFile(join(root, "skills", "draft-message", "SKILL.md"), "utf8");
   const metadata = await readFile(
     join(root, "skills", "draft-message", "agents", "openai.yaml"),
@@ -47,9 +47,10 @@ test("WhatsApp safely adapts bounded evidence into canonical Writing voice", asy
   assert.match(skill, /romantic-partner chat defaults to disclosed mode/i);
   assert.match(skill, /Never hard-code a contact/i);
   assert.match(skill, /Create or update a local WhatsApp draft/i);
-  assert.match(skill, /writing:impersonating/i);
-  assert.match(skill, /Writing\s+is the canonical owner/i);
+  assert.match(skill, /whatsapp:impersonating/i);
+  assert.doesNotMatch(skill, /writing:impersonating/i);
+  assert.match(skill, /Impersonating\s+is the canonical owner/i);
   assert.match(metadata, /allow_implicit_invocation: true/);
   assert.match(metadata, /Use \$draft-message/);
-  assert.match(metadata, /\$draft-user-voice/);
+  assert.match(metadata, /\$impersonating/);
 });
