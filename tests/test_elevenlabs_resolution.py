@@ -168,14 +168,14 @@ class PendingTranscriptionTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.temp.name)
         self.transcripts = self.root / "transcripts.db"
-        # WhatsApp messages come from Convex; answer its `messages` query from memory.
+        # WhatsApp messages come from the bridge's store; answer its `messages` read from memory.
         self.rows = [
             {"id": "message-1", "chatJid": "chat-1", "sender": "sender-1", "timestamp": 1786442400000.0, "mediaType": "audio"},
             {"id": "message-2", "chatJid": "chat-1", "sender": "sender-1", "timestamp": 1786442300000.0, "mediaType": "image"},
         ]
         self.patches = [
             mock.patch.object(MODULE, "transcripts_db_path", return_value=self.transcripts),
-            mock.patch.object(MODULE, "convex_query", side_effect=self.fake_messages_query),
+            mock.patch.object(MODULE, "store_query", side_effect=self.fake_messages_query),
         ]
         for patcher in self.patches:
             patcher.start()

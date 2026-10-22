@@ -126,7 +126,7 @@ test("bridge environment applies a private umask before starting Go", () => {
 
   assert.match(commonEnv, /set -euo pipefail[\s\S]*umask 077/);
   assert.match(startBridge, /source .*common_env\.sh/);
-  assert.match(startBridge, /go", "run", "main\.go"/);
+  assert.match(startBridge, /go", "run", "\."/, "the bridge is a package (main.go, store.go), not one file");
 });
 
 test("phone pairing normalizes WhatsApp's legacy Mexican mobile prefix", () => {
@@ -296,10 +296,11 @@ test("reply metadata is persisted and exposed by the vendored backend", () => {
     "utf8",
   );
 
-  assert.match(bridgeGo, /putString\(message, "replyToMessageId", reply\.MessageID\)/);
-  assert.match(bridgeGo, /putString\(message, "replyToSender", reply\.Sender\)/);
-  assert.match(bridgeGo, /putString\(message, "replyToContent", reply\.Content\)/);
-  assert.match(bridgeGo, /putString\(message, "replyToMediaType", reply\.MediaType\)/);
+  const bridgeStore = fs.readFileSync(
+    path.join(pluginRoot, "vendor", "lharries-whatsapp-mcp", "whatsapp-bridge", "store.go"),
+    "utf8",
+  );
+  assert.match(bridgeStore, /nullString\(reply\.MessageID\), nullString\(reply\.Sender\), nullString\(reply\.Content\), nullString\(reply\.MediaType\)/);
   assert.match(bridgeGo, /extractReplyMetadata/);
 
   assert.match(whatsappPy, /reply_to_message_id: Optional\[str\] = None/);
@@ -421,7 +422,7 @@ test("whatsapp plugin versions stay synchronized", () => {
   );
   const pkg = JSON.parse(fs.readFileSync(path.join(pluginRoot, "package.json"), "utf8"));
 
-  assert.equal(codexManifest.version, "0.12.1");
+  assert.equal(codexManifest.version, "0.13.0");
   assert.equal(claudeManifest.version, codexManifest.version);
   assert.equal(pkg.version, codexManifest.version);
 });
@@ -528,8 +529,8 @@ test("only permanently unavailable audio leaves automatic reconciliation", () =>
 
 const mcpServerDir = path.join(pluginRoot, "vendor", "lharries-whatsapp-mcp", "whatsapp-mcp-server");
 
-// Run Python against the vendored backend with Convex's HTTP API faked in-process
-// (tests/fake_convex.py), so no live deployment is needed.
+// Run Python against the vendored backend with the store's named reads faked
+// in-process (tests/fake_store.py); tests/test_message_store.py covers the SQL.
 function runBackendPython(script) {
   const output = execFileSync("uv", ["run", "python", "-c", script], {
     cwd: mcpServerDir,
@@ -542,7 +543,7 @@ function runBackendPython(script) {
 test("list_messages returns structured reply metadata", () => {
   const parsed = runBackendPython(`
 import json
-from fake_convex import install, message_row, ms
+from fake_store import install, message_row, ms
 calls = install({
     "identity": lambda args: {"chats": [{"jid": "chat@g.us", "name": "Example Launch"}], "lids": [], "self": None},
     "messages": lambda args: [
@@ -579,7 +580,7 @@ test("list_messages returns reactions and read receipts as structured data", () 
   const parsed = runBackendPython(`
 import json
 from dataclasses import asdict
-from fake_convex import install, message_row, ms
+from fake_store import install, message_row, ms
 install({
     "identity": lambda args: {"chats": [], "lids": [], "self": None},
     "messages": lambda args: [
@@ -622,7 +623,7 @@ print(json.dumps({"items": [asdict(message) for message in messages]}, default=s
 test("list_messages merges phone and LID histories for one contact by default", () => {
   const parsed = runBackendPython(`
 import json
-from fake_convex import install, message_row, ms
+from fake_store import install, message_row, ms
 rows = [
     message_row(id="new-1", chatJid="99900123456789@lid", chatName="unresolved-lid", sender="99900123456789",
                 content="new one", timestamp=ms("2026-05-20T21:58:17-05:00")),
@@ -666,10 +667,10 @@ print(json.dumps({
   assert.deepEqual(parsed.exact.map((message) => message.id), ["new-1"]);
 });
 
-test("list_chats filters, sorts, and pages Convex chats client-side", () => {
+test("list_chats filters, sorts, and pages stored chats client-side", () => {
   const parsed = runBackendPython(`
 import json
-from fake_convex import install, ms
+from fake_store import install, ms
 chats = [
     {"jid": "99900123456789@lid", "name": "99900123456789", "lastMessageTime": ms("2026-05-20T21:58:17-05:00"),
      "lastMessage": "hi", "lastSender": "99900123456789", "lastIsFromMe": False},
@@ -707,11 +708,11 @@ print(json.dumps({
   assert.deepEqual(parsed.include_last, [true, true, true, false]);
 });
 
-test("backend reads map Convex rows and surface Convex failures", () => {
+test("backend reads map store rows and surface store failures", () => {
   const parsed = runBackendPython(`
 import json
-import convex_client
-from fake_convex import install, message_row, ms
+import message_store
+from fake_store import install, message_row, ms
 row = message_row(id="m-1", chatJid="chat@g.us", chatName="Team", sender="15551230001@s.whatsapp.net",
                   content="hello", timestamp=ms("2026-04-09T12:15:18-05:00"))
 calls = install({
@@ -743,8 +744,8 @@ out["direct"] = whatsapp.get_direct_chat_by_contact("1555")
 out["last"] = whatsapp.get_last_interaction("15551230001@s.whatsapp.net")
 out["calls"] = calls
 try:
-    convex_client.query("notAFunction")
-except convex_client.ConvexError as exc:
+    message_store.query("notAFunction")
+except message_store.StoreError as exc:
     out["error"] = str(exc)
 print(json.dumps(out, default=str))
 `);
@@ -772,22 +773,27 @@ print(json.dumps(out, default=str))
   assert.equal(parsed.direct, null);
   assert.deepEqual(args.directChat, { phone: "1555" });
   assert.match(parsed.last, /Chat: Team From: Alice: hello/);
-  assert.match(parsed.error, /Convex query whatsapp:notAFunction failed: Could not find function/);
+  assert.match(parsed.error, /Unknown WhatsApp store read: notAFunction/);
 });
 
-test("the backend reads WhatsApp data from Convex, not SQLite", () => {
+test("the backend reads WhatsApp data from the bridge's local SQLite store", () => {
   const whatsappPy = fs.readFileSync(path.join(mcpServerDir, "whatsapp.py"), "utf8");
-  const convexClient = fs.readFileSync(path.join(mcpServerDir, "convex_client.py"), "utf8");
+  const store = fs.readFileSync(path.join(mcpServerDir, "message_store.py"), "utf8");
   const backendCli = fs.readFileSync(path.join(pluginRoot, "scripts", "whatsapp_cli.py"), "utf8");
   const cli = fs.readFileSync(path.join(pluginRoot, "cli", "whatsapp_cli.py"), "utf8");
+  const bridgeStore = fs.readFileSync(path.join(pluginRoot, "vendor", "lharries-whatsapp-mcp", "whatsapp-bridge", "store.go"), "utf8");
 
-  assert.doesNotMatch(whatsappPy, /sqlite3/);
-  assert.doesNotMatch(whatsappPy, /MESSAGES_DB_PATH/);
-  assert.doesNotMatch(backendCli, /db-path/);
-  assert.doesNotMatch(cli, /db-path|messages_db_path|whatsmeow_lid_map/);
-  assert.match(convexClient, /WHATSAPP_CONVEX_URL/);
-  assert.match(convexClient, /WHATSAPP_CONVEX_READ_TOKEN/);
-  assert.match(convexClient, /n4\.convex-read/);
+  assert.ok(!fs.existsSync(path.join(mcpServerDir, "convex_client.py")));
+  for (const source of [whatsappPy, store, backendCli, cli, bridgeStore]) {
+    assert.doesNotMatch(source, /convex|n4\./i, "no Convex deployment or token is involved");
+  }
+  assert.match(whatsappPy, /import message_store/);
+  assert.match(store, /WHATSAPP_MCP_STORE_DIR/);
+  assert.match(store, /messages\.db/);
+  assert.match(store, /mode=ro/, "readers never write the bridge's store");
+  assert.match(bridgeStore, /messages\.db/);
+  assert.match(bridgeStore, /go:embed schema\.sql/);
+  assert.doesNotMatch(cli, /db-path|whatsmeow_lid_map/);
   assert.match(backendCli, /"store-info"/);
 });
 
@@ -811,7 +817,7 @@ test("list_messages surfaces edited_at so a revised message is not read as origi
   const parsed = runBackendPython(`
 import json
 from dataclasses import asdict
-from fake_convex import install, message_row, ms
+from fake_store import install, message_row, ms
 install({
     "identity": lambda args: {"chats": [], "lids": [], "self": None},
     "messages": lambda args: [
@@ -835,4 +841,25 @@ print(json.dumps({"items": {message.id: asdict(message) for message in messages}
     "an edited message must report edited_at so its text is not read as originally sent",
   );
   assert.equal(parsed.items["untouched-1"].edited_at, null);
+});
+
+test("reset-sync relinks the session but keeps message history", () => {
+  const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "whatsapp-reset-"));
+  const store = path.join(stateRoot, "upstream-store");
+  fs.mkdirSync(store, { recursive: true });
+  for (const name of ["messages.db", "messages.db-wal", "whatsapp.db", "drafts.db"]) {
+    fs.writeFileSync(path.join(store, name), name);
+  }
+  try {
+    execFileSync("/bin/zsh", [path.join(pluginRoot, "scripts", "reset_sync.sh")], {
+      encoding: "utf8",
+      env: { ...process.env, WHATSAPP_PLUGIN_STATE_ROOT: stateRoot, WHATSAPP_MCP_HTTP_PORT: "59997" },
+    });
+    assert.equal(fs.readFileSync(path.join(store, "messages.db"), "utf8"), "messages.db");
+    assert.equal(fs.readFileSync(path.join(store, "messages.db-wal"), "utf8"), "messages.db-wal");
+    assert.ok(!fs.existsSync(path.join(store, "whatsapp.db")), "the linked-device session is reset");
+    assert.deepEqual(fs.readdirSync(stateRoot).filter((name) => name.startsWith("reset-history")), []);
+  } finally {
+    fs.rmSync(stateRoot, { recursive: true, force: true });
+  }
 });

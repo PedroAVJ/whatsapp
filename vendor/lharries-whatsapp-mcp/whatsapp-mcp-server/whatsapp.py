@@ -5,11 +5,11 @@ import os.path
 import requests
 import json
 import audio
-import convex_client
+import message_store
 
 # WhatsApp data (chats, messages, reactions, receipts, and the account's
-# LID/phone identity map) is read from Near's Convex deployment; see
-# convex_client.py for the URL and read-token settings.
+# LID/phone identity map) is read from the bridge's local SQLite store; see
+# message_store.py for where it lives.
 WHATSAPP_API_BASE_URL = os.environ.get("WHATSAPP_MCP_API_BASE_URL", "http://127.0.0.1:8080/api")
 
 
@@ -43,7 +43,7 @@ def _load_identity_context():
         "chat_names": {},
     }
 
-    identity = convex_client.query("identity") or {}
+    identity = message_store.query("identity") or {}
     for chat in identity.get("chats") or []:
         jid, name = chat.get("jid"), chat.get("name")
         if isinstance(jid, str) and isinstance(name, str) and name:
@@ -193,18 +193,18 @@ class MessageContext:
     after: List[Message]
 
 def get_sender_name(sender_jid: str) -> str:
-    return convex_client.query("senderName", {"jid": sender_jid}) or sender_jid
+    return message_store.query("senderName", {"jid": sender_jid}) or sender_jid
 
 
 def attach_message_metadata(message: Message, row: dict) -> Message:
-    """Map the reactions and receipts Convex returns with a message row."""
+    """Map the reactions and receipts the store returns with a message row."""
     for reaction in row.get("reactions") or []:
         sender_timestamp_ms = reaction.get("senderTimestampMs")
         is_from_me = reaction.get("isFromMe")
         message.reactions.append(MessageReaction(
             sender=reaction.get("sender"),
             emoji=reaction.get("emoji"),
-            timestamp=convex_client.from_ms(reaction.get("timestamp")),
+            timestamp=message_store.from_ms(reaction.get("timestamp")),
             reaction_message_id=reaction.get("reactionMessageId"),
             target_message_id=reaction.get("targetMessageId"),
             target_sender=reaction.get("targetSender") or None,
@@ -217,7 +217,7 @@ def attach_message_metadata(message: Message, row: dict) -> Message:
         receipt = MessageReceipt(
             sender=receipt_row.get("sender"),
             type=receipt_row.get("type"),
-            timestamp=convex_client.from_ms(receipt_row.get("timestamp")),
+            timestamp=message_store.from_ms(receipt_row.get("timestamp")),
             message_id=receipt_row.get("messageId"),
             chat_jid=receipt_row.get("chatJid"),
             message_sender=receipt_row.get("messageSender") or None,
@@ -230,7 +230,7 @@ def attach_message_metadata(message: Message, row: dict) -> Message:
 
 def row_to_message(row: dict) -> Message:
     message = Message(
-        timestamp=convex_client.from_ms(row["timestamp"]),
+        timestamp=message_store.from_ms(row["timestamp"]),
         sender=row["sender"],
         chat_name=row.get("chatName"),
         content=row.get("content"),
@@ -242,7 +242,7 @@ def row_to_message(row: dict) -> Message:
         reply_to_sender=row.get("replySender"),
         reply_preview=row.get("replyContent"),
         reply_media_type=row.get("replyMediaType"),
-        edited_at=convex_client.from_ms(row.get("editedAt")),
+        edited_at=message_store.from_ms(row.get("editedAt")),
     )
     return attach_message_metadata(message, row)
 
@@ -251,7 +251,7 @@ def row_to_chat(row: dict) -> Chat:
     return Chat(
         jid=row["jid"],
         name=row.get("name"),
-        last_message_time=convex_client.from_ms(row.get("lastMessageTime")) if row.get("lastMessageTime") else None,
+        last_message_time=message_store.from_ms(row.get("lastMessageTime")) if row.get("lastMessageTime") else None,
         last_message=row.get("lastMessage"),
         last_sender=row.get("lastSender"),
         last_is_from_me=_flag(row.get("lastIsFromMe")),
@@ -324,21 +324,21 @@ def list_messages(
 ) -> List[Message]:
     """Get messages matching the specified criteria with optional context.
 
-    A text `query` runs Convex full-text search and then keeps messages whose
-    content contains the text (case-insensitive).
+    A text `query` keeps messages whose content contains the text
+    (case-insensitive).
     """
     identity_context = _load_identity_context()
     args = {"limit": limit, "offset": page * limit}
 
     if after:
         try:
-            args["after"] = convex_client.to_ms(datetime.fromisoformat(after))
+            args["after"] = message_store.to_ms(datetime.fromisoformat(after))
         except ValueError:
             raise ValueError(f"Invalid date format for 'after': {after}. Please use ISO-8601 format.")
 
     if before:
         try:
-            args["before"] = convex_client.to_ms(datetime.fromisoformat(before))
+            args["before"] = message_store.to_ms(datetime.fromisoformat(before))
         except ValueError:
             raise ValueError(f"Invalid date format for 'before': {before}. Please use ISO-8601 format.")
 
@@ -356,7 +356,7 @@ def list_messages(
         args["query"] = query
 
     result = []
-    for row in convex_client.query("messages", args) or []:
+    for row in message_store.query("messages", args) or []:
         message = row_to_message(row)
         message.chat_name = _resolved_chat_name(
             message.chat_jid,
@@ -385,7 +385,7 @@ def get_message_context(
     after: int = 5
 ) -> MessageContext:
     """Get context around a specific message."""
-    value = convex_client.query("context", {"id": message_id, "before": before, "after": after})
+    value = message_store.query("context", {"id": message_id, "before": before, "after": after})
     if not value:
         raise ValueError(f"Message with ID {message_id} not found")
 
@@ -405,7 +405,7 @@ def list_chats(
 ) -> List[Chat]:
     """Get chats matching the specified criteria."""
     client_filter_query = query.strip() if query else None
-    rows = convex_client.query("chats", {"includeLast": include_last_message}) or []
+    rows = message_store.query("chats", {"includeLast": include_last_message}) or []
     identity_context = _load_identity_context()
 
     result = []
@@ -445,7 +445,7 @@ def search_contacts(query: str) -> List[Contact]:
             name=row.get("name"),
             jid=row["jid"],
         )
-        for row in convex_client.query("contacts", {"query": query}) or []
+        for row in message_store.query("contacts", {"query": query}) or []
     ]
 
 
@@ -457,13 +457,13 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
     """
-    rows = convex_client.query("contactChats", {"jid": jid, "limit": limit, "offset": page * limit})
+    rows = message_store.query("contactChats", {"jid": jid, "limit": limit, "offset": page * limit})
     return [row_to_chat(row) for row in rows or []]
 
 
 def get_last_interaction(jid: str) -> str:
     """Get most recent message involving the contact."""
-    row = convex_client.query("lastInteraction", {"jid": jid})
+    row = message_store.query("lastInteraction", {"jid": jid})
     if not row:
         return None
     return format_message(row_to_message(row))
@@ -471,13 +471,13 @@ def get_last_interaction(jid: str) -> str:
 
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]:
     """Get chat metadata by JID."""
-    row = convex_client.query("chat", {"jid": chat_jid, "includeLast": include_last_message})
+    row = message_store.query("chat", {"jid": chat_jid, "includeLast": include_last_message})
     return row_to_chat(row) if row else None
 
 
 def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
     """Get chat metadata by sender phone number."""
-    row = convex_client.query("directChat", {"phone": sender_phone_number})
+    row = message_store.query("directChat", {"phone": sender_phone_number})
     return row_to_chat(row) if row else None
 
 def send_message(recipient: str, message: str) -> Tuple[bool, str]:

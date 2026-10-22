@@ -41,7 +41,7 @@ import subprocess
 
 with open(os.environ["BRIDGE_LOG_FILE"], "ab", buffering=0) as log_file:
     process = subprocess.Popen(
-        ["go", "run", "main.go"],
+        ["go", "run", "."],
         cwd=os.environ["BRIDGE_DIR"],
         env=os.environ.copy(),
         stdin=subprocess.DEVNULL,

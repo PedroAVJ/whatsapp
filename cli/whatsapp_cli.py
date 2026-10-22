@@ -32,9 +32,9 @@ STOP_BRIDGE = SCRIPT_DIR / "stop_bridge.sh"
 STATUS_BRIDGE = SCRIPT_DIR / "status_bridge.sh"
 SETUP = SCRIPT_DIR / "setup.sh"
 RESET_SYNC = SCRIPT_DIR / "reset_sync.sh"
-# WhatsApp data is read from Near's Convex deployment through this client; the
-# backend script uses the same module.
-CONVEX_CLIENT_PATH = SOURCE_ROOT / "vendor" / "lharries-whatsapp-mcp" / "whatsapp-mcp-server" / "convex_client.py"
+# WhatsApp data is read from the bridge's local SQLite store through this module;
+# the backend script uses the same module.
+MESSAGE_STORE_PATH = SOURCE_ROOT / "vendor" / "lharries-whatsapp-mcp" / "whatsapp-mcp-server" / "message_store.py"
 DEFAULT_DRAFTS_DB_PATH = Path(
     os.environ.get("WHATSAPP_DRAFTS_DB_PATH", "~/.local/share/codex-whatsapp/drafts.db")
 ).expanduser()
@@ -160,31 +160,31 @@ def backend_json(*args: str, timeout: int = 120) -> Any:
     return parse_json_output(run_process(["/bin/zsh", str(RUN_CLI), *args], timeout=timeout))
 
 
-_convex_client_module: Any = None
+_message_store_module: Any = None
 
 
-def convex_client() -> Any:
-    global _convex_client_module
-    if _convex_client_module is None:
-        spec = importlib.util.spec_from_file_location("whatsapp_convex_client", CONVEX_CLIENT_PATH)
-        if spec is None or spec.loader is None or not CONVEX_CLIENT_PATH.exists():
+def message_store() -> Any:
+    global _message_store_module
+    if _message_store_module is None:
+        spec = importlib.util.spec_from_file_location("whatsapp_message_store", MESSAGE_STORE_PATH)
+        if spec is None or spec.loader is None or not MESSAGE_STORE_PATH.exists():
             raise CliError(
-                "WhatsApp Convex client is missing.",
-                code="missing_convex_client",
-                details={"path": str(CONVEX_CLIENT_PATH)},
+                "WhatsApp message store module is missing.",
+                code="missing_message_store",
+                details={"path": str(MESSAGE_STORE_PATH)},
             )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        _convex_client_module = module
-    return _convex_client_module
+        _message_store_module = module
+    return _message_store_module
 
 
-def convex_query(name: str, args: dict[str, Any] | None = None) -> Any:
-    client = convex_client()
+def store_query(name: str, args: dict[str, Any] | None = None) -> Any:
+    store = message_store()
     try:
-        return client.query(name, args)
-    except client.ConvexError as exc:
-        raise CliError(str(exc), code="convex_error", details={"function": f"whatsapp:{name}"}) from exc
+        return store.query(name, args)
+    except store.StoreError as exc:
+        raise CliError(str(exc), code="store_error", details={"read": name}) from exc
 
 
 def backend_store_dir() -> Path | None:
@@ -263,9 +263,9 @@ def command_doctor(_args: argparse.Namespace) -> dict[str, Any]:
             "node": command_exists("node"),
         },
         "bridge": None,
-        "convex_url": None,
-        "convex_reachable": False,
         "store_dir": None,
+        "messages_db": None,
+        "store_readable": False,
         "errors": [],
     }
     try:
@@ -275,13 +275,13 @@ def command_doctor(_args: argparse.Namespace) -> dict[str, Any]:
     try:
         info = backend_json("store-info", timeout=30)
         if isinstance(info, dict):
-            report["convex_url"] = info.get("convex_url")
             report["store_dir"] = info.get("store_dir")
+            report["messages_db"] = info.get("messages_db")
     except CliError as exc:
         report["errors"].append({"code": exc.code, "message": str(exc), "details": exc.details})
     try:
-        convex_query("chat", {"jid": "status@broadcast", "includeLast": False})
-        report["convex_reachable"] = True
+        store_query("chat", {"jid": "status@broadcast", "includeLast": False})
+        report["store_readable"] = True
     except CliError as exc:
         report["errors"].append({"code": exc.code, "message": str(exc), "details": exc.details})
     return report
@@ -573,7 +573,7 @@ def load_identity_context() -> dict[str, dict[str, str]]:
         "chat_names": {},
     }
 
-    identity = convex_query("identity") or {}
+    identity = store_query("identity") or {}
     for chat in identity.get("chats") or []:
         jid, name = chat.get("jid"), chat.get("name")
         if isinstance(jid, str) and isinstance(name, str) and name:
@@ -1249,19 +1249,19 @@ AUDIO_SCAN_PAGE_SIZE = 200
 
 
 def audio_messages(*, chat_jid: str | None, since: str | None) -> list[dict[str, Any]]:
-    """Audio messages in Convex, newest first, optionally scoped to a chat and a start time.
+    """Stored audio messages, newest first, optionally scoped to a chat and a start time.
 
     Walks the message history backwards a page at a time with a timestamp
     cursor, so a long history never needs a large offset.
     """
-    client = convex_client()
+    store = message_store()
     base: dict[str, Any] = {"limit": AUDIO_SCAN_PAGE_SIZE, "offset": 0}
     if chat_jid:
         base["chatJids"] = [chat_jid]
     if since:
         try:
-            # `since` is inclusive; Convex's `after` is exclusive.
-            base["after"] = client.to_ms(datetime.fromisoformat(since)) - 1
+            # `since` is inclusive; the store's `after` is exclusive.
+            base["after"] = store.to_ms(datetime.fromisoformat(since)) - 1
         except ValueError as exc:
             raise CliError("--since must be an ISO-8601 date or time.", code="invalid_since") from exc
 
@@ -1269,7 +1269,7 @@ def audio_messages(*, chat_jid: str | None, since: str | None) -> list[dict[str,
     seen: set[tuple[str, str]] = set()
     before: int | None = None
     while True:
-        page = convex_query("messages", {**base, **({"before": before} if before is not None else {})}) or []
+        page = store_query("messages", {**base, **({"before": before} if before is not None else {})}) or []
         new = 0
         for row in page:
             key = (row["id"], row["chatJid"])
@@ -1283,7 +1283,7 @@ def audio_messages(*, chat_jid: str | None, since: str | None) -> list[dict[str,
                         "id": row["id"],
                         "chat_jid": row["chatJid"],
                         "sender": row["sender"],
-                        "timestamp": str(client.from_ms(row["timestamp"])),
+                        "timestamp": str(store.from_ms(row["timestamp"])),
                         "media_type": row.get("mediaType"),
                     }
                 )
@@ -1302,7 +1302,7 @@ def pending_audio_messages(
     retry_failed: bool = False,
     exclude_keys: set[tuple[str, str]] | None = None,
 ) -> tuple[list[dict[str, Any]], int, int]:
-    """Audio messages in WhatsApp's Convex store that have no cached transcript yet.
+    """Stored WhatsApp audio messages that have no cached transcript yet.
 
     Pending means no transcript row exists for the message at all, whatever
     options produced it. Backfill never re-spends on an already transcribed
@@ -2022,7 +2022,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", help="Emit stable JSON envelope to stdout.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("doctor", help="Verify source root, tools, bridge status, and Convex reachability.").set_defaults(func=command_doctor)
+    subparsers.add_parser("doctor", help="Verify source root, tools, bridge status, and that the message store is readable.").set_defaults(func=command_doctor)
 
     bridge_parser = subparsers.add_parser("bridge", help="Manage the local read-only WhatsApp bridge.")
     bridge_sub = bridge_parser.add_subparsers(dest="bridge_command", required=True)

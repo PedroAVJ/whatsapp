@@ -32,4 +32,4 @@ fi
 echo "After pairing, setup will remain connected while WhatsApp sends the maximum linked-device history it permits."
 
 cd "$BRIDGE_DIR"
-exec go run main.go
+exec go run .
