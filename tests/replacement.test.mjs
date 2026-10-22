@@ -880,6 +880,7 @@ test("the macOS app owns the bridge's launch agent through SMAppService", () => 
   assert.match(build, /Contents\/Library\/LaunchAgents\/\{bundle_id\}\.plist/);
   assert.match(build, /codesign --verify --strict --deep/);
   assert.match(build, /mv "\$STAGE" "\$APP"/, "the bundle is swapped in whole, never patched under a running bridge");
+  assert.match(build, /parent bundle identifier = \$BUNDLE_ID[\s\S]*launchctl kickstart -k/, "an update restarts the app's registered agent");
 
   // The agent runs the bridge with the same environment the lifecycle scripts export.
   for (const key of [

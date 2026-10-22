@@ -85,7 +85,7 @@ echo "Installed $APP ($VERSION)"
 
 domain="gui/$(id -u)"
 job="$(launchctl print "$domain/$BUNDLE_ID" 2>/dev/null || true)"
-if [[ "$job" == *"WhatsApp Bridge.app"* ]]; then
+if [[ "$job" == *"parent bundle identifier = $BUNDLE_ID"* ]]; then
   launchctl kickstart -k "$domain/$BUNDLE_ID"
   echo "Restarted the registered agent $BUNDLE_ID"
 else
